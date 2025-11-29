@@ -235,8 +235,9 @@ class DevicePanel(ttk.LabelFrame):
         
         self.columnconfigure(1, weight=1)
         
-        # Initial refresh
-        self.refresh_devices()
+        # Note: initial refresh will be triggered by the main application
+        # after all panels are created to avoid calling back into
+        # panels that haven't been initialized yet.
     
     def refresh_devices(self):
         """Refresh the device list"""
@@ -852,10 +853,17 @@ class ADBGUI(tk.Tk):
         self.create_logcat_tab()
         self.create_tools_tab()
         
+        # After all tabs are created, the initial device refresh will be
+        # performed after the status bar is created so callbacks can update
+        # status-related variables.
+        
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
         status_bar = ttk.Label(main_container, textvariable=self.status_var, relief='sunken', anchor='w')
         status_bar.pack(fill='x', pady=(10, 0))
+        
+        # Perform an initial device refresh now that all panels and status exist
+        self.device_panel.refresh_devices()
         
         # Set up periodic device refresh
         self.after(5000, self.periodic_refresh)
