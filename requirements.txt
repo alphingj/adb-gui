@@ -1,0 +1,10 @@
+# ADB GUI Requirements
+# No external dependencies required - uses Python standard library (tkinter)
+# tkinter is included with Python on most systems
+#
+# Optional: For enhanced functionality on some systems:
+# pip install tkinter (if not included with Python)
+#
+# Required system dependency:
+# - Android SDK Platform Tools (for adb command)
+#   Download from: https://developer.android.com/studio/releases/platform-tools
