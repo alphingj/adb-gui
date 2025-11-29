@@ -34,7 +34,7 @@ class ADBWrapper:
             '/usr/local/bin/adb',
             os.path.expanduser('~/Android/Sdk/platform-tools/adb'),
             os.path.expanduser('~/Library/Android/sdk/platform-tools/adb'),
-            'C:\\Users\\%USERNAME%\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe',
+            os.path.expandvars('C:\\Users\\%USERNAME%\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe'),
         ]
         
         for path in common_paths:
@@ -612,8 +612,9 @@ class ShellPanel(ttk.LabelFrame):
         
         # Run command in thread to avoid blocking UI
         def run():
-            output, success = self.adb.run_shell_command(command, self.device_id)
-            self.after(0, lambda: self.append_output(output + "\n"))
+            result, success = self.adb.run_shell_command(command, self.device_id)
+            # Capture result in closure to avoid race condition
+            self.after(0, lambda result=result: self.append_output(result + "\n"))
         
         threading.Thread(target=run, daemon=True).start()
     
@@ -770,9 +771,12 @@ class LogcatPanel(ttk.LabelFrame):
                 while self.is_running and self.process.poll() is None:
                     line = self.process.stdout.readline()
                     if line:
+                        # Capture line value explicitly to avoid closure issues
                         self.after(0, lambda l=line: self.append_log(l))
             except Exception as e:
-                self.after(0, lambda: self.append_log(f"Error: {e}\n"))
+                # Capture error message explicitly
+                error_msg = f"Error: {e}\n"
+                self.after(0, lambda msg=error_msg: self.append_log(msg))
             finally:
                 self.after(0, self._on_logcat_stopped)
         
