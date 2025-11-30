@@ -139,6 +139,12 @@ echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="*", MODE="0666", GROUP="plugdev"' | sud
 sudo udevadm control --reload-rules
 ```
 
+## Documentation
+
+Additional guides and documentation can be found in the [docs](docs/) folder:
+
+- [Installing TWRP on Samsung Galaxy A51 5G using Heimdall](docs/TWRP_INSTALLATION_GUIDE.md)
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
@@ -151,4 +157,4 @@ This project is open source and available under the MIT License.
 
 - Android Debug Bridge (ADB) - Google
 - Python tkinter - Python Software Foundation
-# adb-gui
+- Heimdall - Benjamin Dobell, Glass Echidna
