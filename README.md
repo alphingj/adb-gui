@@ -151,4 +151,4 @@ This project is open source and available under the MIT License.
 
 - Android Debug Bridge (ADB) - Google
 - Python tkinter - Python Software Foundation
-# adb-gui
+

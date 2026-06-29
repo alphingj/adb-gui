@@ -21,13 +21,10 @@ class ADBWrapper:
     
     def _find_adb(self):
         """Find ADB executable in PATH or common locations"""
-        import subprocess
-        try:
-            result = subprocess.run(['which', 'adb'], capture_output=True, text=True)
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception:
-            pass
+        import shutil
+        adb_in_path = shutil.which('adb')
+        if adb_in_path:
+            return adb_in_path
         return 'adb'
     
     def run_command(self, *args, timeout=30):
