@@ -59,17 +59,36 @@ class ADBWrapper:
         
         return 'adb'
     
-    def run_command(self, *args, timeout=30):
-        """Run an ADB command and return the output"""
+    def run_command(self, *args, timeout=30, binary=False):
+        """Run an ADB command and return the output
+        
+        Args:
+            *args: Command arguments
+            timeout: Timeout in seconds
+            binary: If True, return bytes instead of string
+            
+        Returns:
+            tuple: (output, success)
+        """
         cmd = [self.adb_path] + list(args)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return result.stdout + result.stderr, result.returncode == 0
+            if binary:
+                result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+                return result.stdout + result.stderr, result.returncode == 0
+            else:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                return result.stdout + result.stderr, result.returncode == 0
         except subprocess.TimeoutExpired:
+            if binary:
+                return b"Command timed out", False
             return "Command timed out", False
         except FileNotFoundError:
+            if binary:
+                return b"ADB not found", False
             return "ADB not found. Please install Android SDK Platform Tools.", False
         except Exception as e:
+            if binary:
+                return str(e).encode(), False
             return str(e), False
     
     def get_devices(self):
@@ -287,16 +306,17 @@ class ADBWrapper:
     def get_app_icon(self, package_name, device_id=None, icon_size=DEFAULT_ICON_SIZE):
         """Get app icon as binary data
         
-        Args:
-            package_name: The package name of the app
-            device_id: The device ID (optional)
-            icon_size: Desired icon size in pixels (default 128)
-            
         Returns:
-            bytes: PNG image data or None on failure
+            tuple: (bytes or None, error message or None)
         """
         prefix = ['-s', device_id] if device_id else []
-        return self.run_command(*prefix, 'shell', 'cmd', 'package', 'dump-icon', package_name, '--png')
+        
+        # Try dump-icon first (Android 6.0+)
+        output, success = self.run_command(*prefix, 'shell', 'cmd', 'package', 'dump-icon', package_name, '--png', binary=True)
+        if success and output:
+            return output, None
+        
+        return None, "Could not retrieve icon"
 
 
 class DevicePanel(ttk.LabelFrame):
@@ -403,12 +423,22 @@ class AppManagerPanel(ttk.LabelFrame):
         self.adb = adb
         self.device_id = None
         self.icon_cache = {}
+        self.all_packages = []
         
         controls = ttk.Frame(self)
         controls.pack(fill='x', pady=(0, 5))
         
         self.third_party_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(controls, text="Third-party apps only", variable=self.third_party_var).pack(side='left')
+        
+        search_frame = ttk.Frame(controls)
+        search_frame.pack(side='left', padx=10)
+        ttk.Label(search_frame, text="Search:").pack(side='left')
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=20)
+        self.search_entry.pack(side='left', padx=5)
+        self.search_var.trace('w', self._on_search_change)
+        
         ttk.Button(controls, text="Refresh", command=self.refresh_apps).pack(side='left', padx=5)
         ttk.Button(controls, text="Install APK", command=self.install_apk).pack(side='left', padx=5)
         ttk.Button(controls, text="Uninstall Selected", command=self.uninstall_selected).pack(side='left', padx=5)
@@ -448,6 +478,8 @@ class AppManagerPanel(ttk.LabelFrame):
         """Set the current device"""
         self.device_id = device_id
         self.icon_cache.clear()
+        self.all_packages = []
+        self.search_var.set('')
         self.refresh_apps()
     
     def refresh_apps(self):
@@ -458,9 +490,22 @@ class AppManagerPanel(ttk.LabelFrame):
         if not self.device_id:
             return
         
-        packages = self.adb.list_packages(self.device_id, self.third_party_var.get())
+        self.all_packages = self.adb.list_packages(self.device_id, self.third_party_var.get())
+        self._filter_apps()
+    
+    def _filter_apps(self):
+        """Filter apps based on search term"""
+        search_term = self.search_var.get().lower()
+        for item in self.app_tree.get_children():
+            self.app_tree.delete(item)
+        
+        packages = [p for p in self.all_packages if search_term in p.lower()]
         for pkg in packages:
             self.app_tree.insert('', 'end', text='', values=(pkg,))
+    
+    def _on_search_change(self, *args):
+        """Handle search text change"""
+        self._filter_apps()
     
     def _on_selection_change(self, event=None):
         """Handle selection change in app tree"""
