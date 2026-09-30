@@ -1,10 +1,22 @@
 # ADB GUI Requirements
-# No external dependencies required - uses Python standard library (tkinter)
-# tkinter is included with Python on most systems
 #
-# Optional: For enhanced functionality on some systems:
-# pip install tkinter (if not included with Python)
+# There are no required third-party packages: the app uses the Python
+# standard library.
 #
-# Required system dependency:
-# - Android SDK Platform Tools (for adb command)
-#   Download from: https://developer.android.com/studio/releases/platform-tools
+# System requirements:
+# - Python 3.7 or higher
+# - tkinter (ships with Python on Windows/macOS; on Debian/Ubuntu:
+#     sudo apt install python3-tk
+#   pip cannot install tkinter — "pip install tkinter" is not a package.)
+# - Android SDK Platform Tools (for the `adb` command)
+#     https://developer.android.com/studio/releases/platform-tools
+#
+# Optional:
+# - Pillow, for resizing app icons to fit the icon box:
+#     pip install Pillow
+#   Without it the app runs normally and uses the icon at its native size.
+#
+# Running the tests:
+#     python3 -m pytest tests/
+#   or, without pytest:
+#     python3 -m unittest discover -s tests

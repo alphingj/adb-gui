@@ -2,7 +2,7 @@
 
 A comprehensive graphical user interface for Android Debug Bridge (ADB) tools.
 
-![Python](https://img.shields.io/badge/Python-3.6+-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.7+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
@@ -10,10 +10,10 @@ A comprehensive graphical user interface for Android Debug Bridge (ADB) tools.
 
 - **Device Management**: Automatically detect and connect to Android devices
 - **Device Information**: View detailed device specifications (model, Android version, battery status, etc.)
-- **App Manager**: Install, uninstall, and list applications on your device
+- **App Manager**: Install, uninstall, freeze/unfreeze, and clear data for applications on your device
 - **File Manager**: Browse, push, and pull files between device and computer
 - **Shell Terminal**: Execute shell commands directly on the device
-- **Logcat Viewer**: Real-time log viewing with color-coded log levels
+- **Logcat Viewer**: Real-time log viewing with color-coded log levels and a live filter
 - **Tools**: Take screenshots, reboot to different modes (normal, recovery, bootloader)
 
 ## Screenshots
@@ -31,9 +31,10 @@ The application provides a tabbed interface with the following panels:
 
 ### System Requirements
 
-- Python 3.6 or higher
-- tkinter (usually included with Python)
+- Python 3.7 or higher
+- tkinter (usually included with Python; on Debian/Ubuntu: `sudo apt install python3-tk`)
 - Android SDK Platform Tools (for the `adb` command)
+- Optional: [Pillow](https://pypi.org/project/Pillow/) (`pip install Pillow`) to downscale app icons smoothly; without it the app still runs and Tk subsamples large icons instead
 
 ### Installing Android SDK Platform Tools
 
@@ -63,7 +64,7 @@ git clone https://github.com/alphingj/adb-gui.git
 cd adb-gui
 ```
 
-2. Ensure Python 3.6+ is installed:
+2. Ensure Python 3.7+ is installed:
 ```bash
 python3 --version
 ```
@@ -92,14 +93,21 @@ View comprehensive device information including:
 
 ### Apps Tab
 - View installed applications (filter by third-party or all)
+- App icons, optionally fetched from the Play Store
 - Install APK files from your computer
 - Uninstall selected applications
+- **Freeze / Unfreeze**: disables an app in place with `pm disable-user`
+  instead of uninstalling it — the app stays installed, its data and
+  version are untouched, and the same button reverses it
+- Clear an app's data
 
 ### Files Tab
 - Navigate the device file system
 - Double-click folders to enter them
 - Pull files from device to computer
 - Push files from computer to device
+- Listing failures (for example permission denied) are reported above the
+  file list instead of looking like an empty folder
 
 ### Shell Tab
 - Execute any shell command on the device
@@ -110,11 +118,24 @@ View comprehensive device information including:
 - Real-time log viewing
 - Color-coded by log level (Verbose, Debug, Info, Warning, Error, Fatal)
 - Start/Stop controls
-- Filter logs by tag
+- Live case-insensitive text filter over the buffered log
 
 ### Tools Tab
 - Take screenshots (saved as PNG)
 - Reboot device (normal, recovery, or bootloader mode)
+
+## Tests
+
+The test suite runs against the real application code and needs no device:
+
+```bash
+python3 -m pytest tests/
+# or, without pytest:
+python3 -m unittest discover -s tests
+```
+
+Most tests need a display for Tk; on a headless machine run them under
+`xvfb-run`.
 
 ## Troubleshooting
 
