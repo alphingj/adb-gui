@@ -5,23 +5,153 @@ ADB GUI - A graphical user interface for Android Debug Bridge (ADB)
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
+import base64
+import atexit
+import io
+import queue
 import subprocess
 import threading
 import os
+import posixpath
 import re
+import shlex
 import shutil
 import sys
-import tempfile
+import time
+import traceback
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
 
 DEFAULT_ICON_SIZE = 128
-SMALL_ICON_SIZE = 32
+PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+PLAY_STORE_URL = ('https://play.google.com/store/apps/details'
+                  '?id={package}&hl=en&gl=US')
+USER_AGENT = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/120 Safari/537.36')
+
+# States adb reports in the second column of `adb devices` output.
+DEVICE_STATUSES = {
+    'device', 'offline', 'unauthorized', 'recovery', 'sideload',
+    'rescue', 'bootloader', 'host', 'no permissions', 'unknown',
+}
+
+
+def parse_device_list(output):
+    """Parse `adb devices -l` output into a list of device dicts.
+
+    Only lines whose second token is a known adb device state are kept, so
+    adb's own chatter (server version warnings, daemon startup banners) can
+    never be mistaken for a connected device.
+    """
+    devices = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        device_id, status = parts[0], parts[1]
+        if status == 'no' and len(parts) > 2 and parts[2] == 'permissions':
+            status = 'no permissions'  # "no permissions (missing udev rules)"
+        elif status not in DEVICE_STATUSES:
+            continue
+        # A serial never ends in ':' — that rejects "error: device offline".
+        if device_id.endswith(':'):
+            continue
+
+        model = ''
+        for part in parts[2:]:
+            if part.startswith('model:'):
+                model = part[len('model:'):]
+                break
+
+        devices.append({
+            'id': device_id,
+            'status': status,
+            'model': model
+        })
+    return devices
+
+
+def decode_icon(image_bytes, max_size=DEFAULT_ICON_SIZE):
+    """Turn icon bytes into something displayable. Never touches Tk.
+
+    Returns PNG bytes no larger than `max_size`, or None when the data is
+    not an image this machine can decode — adb likes to answer with plain
+    text such as "Unknown command: dump-icon".
+    """
+    if not image_bytes:
+        return None
+    if HAS_PIL:
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert('RGBA')
+            image.thumbnail((max_size, max_size), Image.LANCZOS)
+            buffer = io.BytesIO()
+            image.save(buffer, format='PNG')
+            return buffer.getvalue()
+        except Exception:
+            return None
+    if image_bytes.startswith(PNG_SIGNATURE):
+        return image_bytes
+    return None
+
+
+def make_photo(png_bytes, max_size=DEFAULT_ICON_SIZE):
+    """Wrap PNG bytes in a tk.PhotoImage. Tk objects belong on the Tk thread."""
+    photo = tk.PhotoImage(data=base64.b64encode(png_bytes).decode('ascii'))
+    largest = max(photo.width(), photo.height())
+    if largest > max_size:
+        # Integer shrink, used when Pillow was not there to downscale for us.
+        photo = photo.subsample(-(-largest // max_size))
+    return photo
+
+
+def parse_play_icon_url(html):
+    """Return the og:image URL of a Play Store listing page, if it has one."""
+    match = (re.search(r'<meta[^>]*property="og:image"[^>]*content="([^"]+)"', html)
+             or re.search(r'<meta[^>]*content="([^"]+)"[^>]*property="og:image"', html))
+    return match.group(1) if match else None
+
+
+def fetch_play_icon(package_name, timeout=15):
+    """Download an app icon from its Play Store listing.
+
+    Fallback for devices whose `cmd package` cannot dump icons. Returns
+    (bytes, None) or (None, reason) — only one app is looked up, and only
+    when the user selects it.
+    """
+    headers = {'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9'}
+
+    def get(url, limit):
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers=headers), timeout=timeout
+        ) as response:
+            return response.read(limit)
+
+    try:
+        html = get(PLAY_STORE_URL.format(package=package_name),
+                   4_000_000).decode('utf-8', 'replace')
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None, "not published on the Play Store"
+        return None, f"Play Store answered HTTP {error.code}"
+    except (urllib.error.URLError, OSError):
+        return None, "no network connection"
+
+    icon_url = parse_play_icon_url(html)
+    if not icon_url:
+        return None, "no icon listed on the Play Store"
+
+    try:
+        return get(icon_url, 5_000_000), None
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return None, "could not download the Play Store icon"
 
 
 class ADBWrapper:
@@ -29,6 +159,9 @@ class ADBWrapper:
     
     def __init__(self):
         self.adb_path = self._find_adb()
+        self._track_proc = None
+        self._track_lock = threading.Lock()
+        self._tracking_stopped = False
     
     def _find_adb(self):
         """Find ADB executable in PATH or common locations"""
@@ -76,7 +209,10 @@ class ADBWrapper:
                 result = subprocess.run(cmd, capture_output=True, timeout=timeout)
                 return result.stdout + result.stderr, result.returncode == 0
             else:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                # errors='replace': a single non-UTF-8 file name on the device
+                # must not abort the whole listing.
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        errors='replace', timeout=timeout)
                 return result.stdout + result.stderr, result.returncode == 0
         except subprocess.TimeoutExpired:
             if binary:
@@ -96,26 +232,86 @@ class ADBWrapper:
         output, success = self.run_command('devices', '-l')
         if not success:
             return []
-        
-        devices = []
-        lines = output.strip().split('\n')[1:]
-        for line in lines:
-            if line.strip():
-                parts = line.split()
-                if len(parts) >= 2:
-                    device_id = parts[0]
-                    status = parts[1]
-                    model = ""
-                    for part in parts:
-                        if part.startswith('model:'):
-                            model = part.replace('model:', '')
-                            break
-                    devices.append({
-                        'id': device_id,
-                        'status': status,
-                        'model': model
-                    })
-        return devices
+        return parse_device_list(output)
+
+    def track_devices(self, on_change):
+        """Block while streaming device-list change notifications.
+
+        Runs `adb track-devices -l` and consumes the hex4-length framed
+        stream the adb server emits whenever a device is added, removed or
+        changes state, calling `on_change` for every frame. Returns when the
+        stream ends; the return value reports whether the stream was ever
+        framed correctly (False means track-devices is unavailable).
+
+        `on_change` runs on the calling thread, so the caller is responsible
+        for marshalling back onto the Tk thread.
+        """
+        try:
+            proc = subprocess.Popen(
+                [self.adb_path, 'track-devices', '-l'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+        except OSError:
+            return False
+
+        framed = False
+        with self._track_lock:
+            if self._tracking_stopped:
+                # stop_tracking ran while Popen was in flight; without this
+                # the child would never be registered and never killed.
+                register = False
+            else:
+                self._track_proc = proc
+                register = True
+        if not register:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return False
+        try:
+            while True:
+                header = proc.stdout.read(4)
+                if len(header) < 4:
+                    return framed
+                try:
+                    length = int(header, 16)
+                except ValueError:
+                    return framed
+                framed = True
+                remaining = length
+                while remaining:
+                    chunk = proc.stdout.read(remaining)
+                    if not chunk:
+                        return framed
+                    remaining -= len(chunk)
+                on_change()
+        finally:
+            with self._track_lock:
+                if self._track_proc is proc:
+                    self._track_proc = None
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def stop_tracking(self):
+        """Stop tracking for good: kill the stream and refuse to start another.
+
+        Called on shutdown, so a stream racing with the kill is stopped too
+        rather than leaking an unregistered `adb track-devices` child.
+        """
+        with self._track_lock:
+            self._tracking_stopped = True
+            proc, self._track_proc = self._track_proc, None
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
     
     def get_device_info(self, device_id=None):
         """Get detailed device information"""
@@ -152,6 +348,14 @@ class ADBWrapper:
         
         return info
     
+    @staticmethod
+    def _package_names(output):
+        """Package names from any `pm list packages` output."""
+        return sorted(
+            line[len('package:'):] for line in output.strip().splitlines()
+            if line.startswith('package:')
+        )
+    
     def list_packages(self, device_id=None, third_party_only=True):
         """List installed packages"""
         prefix = ['-s', device_id] if device_id else []
@@ -162,12 +366,32 @@ class ADBWrapper:
         output, success = self.run_command(*args)
         if not success:
             return []
-        
-        packages = []
-        for line in output.strip().split('\n'):
-            if line.startswith('package:'):
-                packages.append(line.replace('package:', ''))
-        return sorted(packages)
+        return self._package_names(output)
+    
+    def list_frozen_packages(self, device_id=None):
+        """Packages that are frozen (disabled) instead of uninstalled."""
+        prefix = ['-s', device_id] if device_id else []
+        output, success = self.run_command(
+            *prefix, 'shell', 'pm', 'list', 'packages', '-d')
+        if not success:
+            return []
+        return self._package_names(output)
+    
+    def freeze_package(self, package_name, device_id=None):
+        """Freeze an app in place: disabled, still installed, data kept.
+
+        `pm disable-user` (not `uninstall`) is what makes this reversible;
+        `-k` must not be combined with `--user`, Android rejects it.
+        """
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'pm', 'disable-user',
+                                '--user', '0', package_name, timeout=60)
+    
+    def unfreeze_package(self, package_name, device_id=None):
+        """Bring a frozen app back to its normal state."""
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'pm', 'enable',
+                                '--user', '0', package_name, timeout=60)
     
     def install_apk(self, apk_path, device_id=None):
         """Install an APK file"""
@@ -180,29 +404,52 @@ class ADBWrapper:
         return self.run_command(*prefix, 'uninstall', package_name)
     
     def list_files(self, path, device_id=None):
-        """List files in a directory on the device"""
+        """List files in a directory on the device.
+
+        Returns (files, error): error is None when the listing succeeded.
+        An empty directory is not an error; a failed `ls` (permission
+        denied, missing directory) comes back as a message so the caller
+        can tell the two apart instead of showing a blank listing.
+
+        The path is quoted because `adb shell` joins its arguments with
+        spaces, so an unquoted path containing spaces lists nothing.
+        """
         prefix = ['-s', device_id] if device_id else []
-        output, success = self.run_command(*prefix, 'shell', 'ls', '-la', path)
+        output, success = self.run_command(
+            *prefix, 'shell', 'ls -la ' + shlex.quote(path))
         if not success:
-            return []
+            lines = [line for line in output.splitlines() if line.strip()]
+            return [], lines[-1] if lines else f'Cannot list {path}'
         
         files = []
-        for line in output.strip().split('\n'):
-            if line and not line.startswith('total'):
-                parts = line.split()
-                if len(parts) >= 8:
-                    permissions = parts[0]
-                    size = parts[4] if len(parts) > 4 else ''
-                    name = ' '.join(parts[7:]) if len(parts) > 7 else ''
-                    if name and name not in ['.', '..']:
-                        is_dir = permissions.startswith('d')
-                        files.append({
-                            'name': name,
-                            'is_dir': is_dir,
-                            'size': size,
-                            'permissions': permissions
-                        })
-        return files
+        for line in output.splitlines():
+            line = line.rstrip('\r')
+            if not line:
+                continue
+            # maxsplit keeps the rest of the line intact, so names with
+            # spaces survive (split() would collapse them).
+            parts = line.split(' ', 7)
+            if len(parts) < 8:
+                continue
+            permissions = parts[0]
+            # Rows are 10-character permission strings; `total 4` and any
+            # stray error text are not, so they cannot parse as entries.
+            if len(permissions) != 10 or permissions[0] not in 'dcbpls-':
+                continue
+            name = parts[7]
+            # Symlinks print as `name -> target`; split that off, but only
+            # for symlinks, so a regular file called `a -> b` is kept whole.
+            if permissions[0] == 'l' and ' -> ' in name:
+                name = name.split(' -> ', 1)[0]
+            if name in ('.', '..'):
+                continue
+            files.append({
+                'name': name,
+                'is_dir': permissions.startswith('d'),
+                'size': parts[4],
+                'permissions': permissions
+            })
+        return files, None
     
     def pull_file(self, remote_path, local_path, device_id=None):
         """Pull a file from device"""
@@ -303,30 +550,137 @@ class ADBWrapper:
         prefix = ['-s', device_id] if device_id else []
         return self.run_command(*prefix, 'reverse', f'tcp:{device_port}', f'tcp:{host_port}')
     
-    def get_app_icon(self, package_name, device_id=None, icon_size=DEFAULT_ICON_SIZE):
-        """Get app icon as binary data
-        
+    def get_app_icon(self, package_name, device_id=None):
+        """Get an app icon as PNG bytes
+
         Returns:
             tuple: (bytes or None, error message or None)
         """
         prefix = ['-s', device_id] if device_id else []
         
-        # Try dump-icon first (Android 6.0+)
-        output, success = self.run_command(*prefix, 'shell', 'cmd', 'package', 'dump-icon', package_name, '--png', binary=True)
-        if success and output:
-            return output, None
-        
-        return None, "Could not retrieve icon"
+        output, success = self.run_command(
+            *prefix, 'shell', 'cmd', 'package', 'dump-icon', package_name,
+            '--png', binary=True
+        )
+        if not output:
+            return None, "Could not retrieve icon"
+        if not output.startswith(PNG_SIGNATURE):
+            # adb answered with text, e.g. "Unknown command: dump-icon".
+            first_line = output.decode('utf-8', 'replace').strip().split('\n')[0]
+            return None, first_line or "Device returned no icon"
+        if not success:
+            return None, "Could not retrieve icon"
+        return output, None
+
+
+class TaskRunner:
+    """Runs blocking work off the Tk thread and hands results back to it.
+
+    The Tk thread only ever queues jobs (`submit`) and drains completed
+    callbacks (`_drain` on a timer); worker threads only ever queue results
+    (`post`). Neither side touches the other's queue directly, so no Tk call
+    is ever made from a background thread and the UI never blocks on adb.
+    """
+
+    POLL_MS = 30
+
+    def __init__(self, root, on_status=None):
+        self._root = root
+        self._on_status = on_status
+        self._jobs = queue.Queue()
+        self._ready = queue.Queue()
+        self._labels = []
+        self._drain_id = None
+        threading.Thread(target=self._work, name='adb-worker', daemon=True).start()
+        self._drain()
+
+    def close(self):
+        """Stop delivering results. Call before the root is destroyed."""
+        if self._drain_id is None:
+            return
+        try:
+            self._root.after_cancel(self._drain_id)
+        except tk.TclError:
+            pass
+        self._drain_id = None
+
+    def post(self, fn, *args):
+        """Schedule fn(*args) on the Tk thread. Safe from any thread."""
+        self._ready.put((fn, args))
+
+    def submit(self, fn, on_done=None, label="", widgets=()):
+        """Queue fn() on the worker; on_done(result) runs on the Tk thread.
+
+        `label` is shown in the status bar while the job is pending and
+        `widgets` are disabled until it finishes.
+        """
+        for widget in widgets:
+            widget.config(state='disabled')
+        self._labels.append(label)
+        self._jobs.put((fn, on_done, label, widgets))
+        self._notify_status()
+
+    def _work(self):
+        while True:
+            fn, on_done, label, widgets = self._jobs.get()
+            try:
+                result, error = fn(), None
+            except Exception as exc:
+                result, error = None, exc
+            self.post(self._finish, on_done, result, error, label, widgets)
+
+    def _finish(self, on_done, result, error, label, widgets):
+        if label in self._labels:
+            self._labels.remove(label)
+        for widget in widgets:
+            try:
+                widget.config(state='normal')
+            except tk.TclError:
+                pass
+        if error is not None:
+            messagebox.showerror(
+                "Error",
+                f"{label or 'Background task'} failed:\n{error}"
+            )
+        elif on_done is not None:
+            on_done(result)
+        self._notify_status()
+
+    def _notify_status(self):
+        if self._on_status:
+            self._on_status(self._labels[-1] if self._labels else None)
+
+    def _drain(self):
+        # Reschedule before running callbacks: a callback may open a modal
+        # dialog, and that nested event loop must still deliver results.
+        try:
+            self._drain_id = (self._root.after(self.POLL_MS, self._drain)
+                              if self._root.winfo_exists() else None)
+        except tk.TclError:
+            self._drain_id = None
+            return
+        while True:
+            try:
+                fn, args = self._ready.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception:
+                traceback.print_exc()
 
 
 class DevicePanel(ttk.LabelFrame):
     """Panel for device selection and basic info"""
     
-    def __init__(self, parent, adb, on_device_change=None):
+    def __init__(self, parent, adb, runner, on_device_change=None):
         super().__init__(parent, text="Device", padding=10)
         self.adb = adb
+        self.runner = runner
         self.on_device_change = on_device_change
         self.current_device = None
+        self.devices = {}
+        self._selected_state = None
         
         ttk.Label(self, text="Select Device:").grid(row=0, column=0, sticky='w')
         self.device_var = tk.StringVar()
@@ -342,8 +696,11 @@ class DevicePanel(ttk.LabelFrame):
         self.columnconfigure(1, weight=1)
     
     def refresh_devices(self):
-        """Refresh the device list"""
-        devices = self.adb.get_devices()
+        """Refresh the device list without blocking the Tk thread."""
+        self.runner.submit(self.adb.get_devices, self._apply_devices,
+                           label="Listing devices")
+
+    def _apply_devices(self, devices):
         self.devices = {f"{d['id']} ({d['model']})" if d['model'] else d['id']: d for d in devices}
         
         device_names = list(self.devices.keys())
@@ -357,20 +714,35 @@ class DevicePanel(ttk.LabelFrame):
             self.device_var.set('')
             self.current_device = None
             self.status_label.config(text="No device connected", foreground='gray')
+            self._selected_state = None
+            # Panels ignore this when they already have no device, so this
+            # only ever resets state left over from a device we just lost.
             if self.on_device_change:
                 self.on_device_change(None)
     
     def _on_device_selected(self, event):
-        """Handle device selection"""
+        """Handle device selection.
+
+        Only reports a change to the panels when the selected device *or*
+        its state actually differs from the last one reported, so periodic
+        refreshes can never reset panels the user is working in.
+        """
         selected = self.device_var.get()
-        if selected in self.devices:
-            device = self.devices[selected]
-            self.current_device = device['id']
-            status = device['status']
-            color = 'green' if status == 'device' else 'orange'
-            self.status_label.config(text=f"Status: {status}", foreground=color)
-            if self.on_device_change:
-                self.on_device_change(self.current_device)
+        if selected not in self.devices:
+            return
+
+        device = self.devices[selected]
+        status = device['status']
+        color = 'green' if status == 'device' else 'orange'
+        self.status_label.config(text=f"Status: {status}", foreground=color)
+
+        state = (device['id'], status)
+        if state == self._selected_state:
+            return
+        self._selected_state = state
+        self.current_device = device['id']
+        if self.on_device_change:
+            self.on_device_change(self.current_device)
     
     def get_current_device(self):
         """Get the currently selected device ID"""
@@ -380,56 +752,86 @@ class DevicePanel(ttk.LabelFrame):
 class DeviceInfoPanel(ttk.LabelFrame):
     """Panel for displaying device information"""
     
-    def __init__(self, parent, adb):
+    def __init__(self, parent, adb, runner):
         super().__init__(parent, text="Device Information", padding=10)
         self.adb = adb
+        self.runner = runner
         self.device_id = None
         
         self.info_text = scrolledtext.ScrolledText(self, height=12, width=50, state='disabled')
         self.info_text.pack(fill='both', expand=True)
         
         ttk.Button(self, text="Refresh Info", command=self.refresh_info).pack(pady=(5, 0))
+        self._write("No device selected")
     
     def set_device(self, device_id):
         """Set the current device"""
+        if device_id == self.device_id:
+            return
         self.device_id = device_id
         self.refresh_info()
     
     def refresh_info(self):
-        """Refresh device information"""
+        """Refresh device information on the worker thread."""
+        if not self.device_id:
+            self._write("No device selected")
+            return
+        
+        self._write("Loading device information...\n")
+        device_id = self.device_id
+        self.runner.submit(
+            lambda: self.adb.get_device_info(device_id),
+            lambda info: self._show_info(info, device_id),
+            label="Reading device info"
+        )
+    
+    def _show_info(self, info, device_id):
+        # The user may have switched devices while we were reading.
+        if device_id != self.device_id:
+            return
+        if not info:
+            self._write("No information available")
+            return
+        self._write("".join(f"{key}: {value}\n" for key, value in info.items()))
+    
+    def _write(self, text):
         self.info_text.config(state='normal')
         self.info_text.delete('1.0', tk.END)
-        
-        if not self.device_id:
-            self.info_text.insert(tk.END, "No device selected")
-        else:
-            self.info_text.insert(tk.END, "Loading device information...\n")
-            self.update()
-            
-            info = self.adb.get_device_info(self.device_id)
-            self.info_text.delete('1.0', tk.END)
-            
-            for key, value in info.items():
-                self.info_text.insert(tk.END, f"{key}: {value}\n")
-        
+        self.info_text.insert(tk.END, text)
         self.info_text.config(state='disabled')
 
 
 class AppManagerPanel(ttk.LabelFrame):
     """Panel for app management with icon display"""
     
-    def __init__(self, parent, adb):
+    def __init__(self, parent, adb, runner):
         super().__init__(parent, text="App Manager", padding=10)
         self.adb = adb
+        self.runner = runner
         self.device_id = None
         self.icon_cache = {}
         self.all_packages = []
+        self.frozen_packages = set()
+        # Only the newest icon request may touch the panel; older ones that
+        # are already queued are dropped by the worker before they run.
+        self._icon_token = 0
+        self._icon_lock = threading.Lock()
+        self._icon_wanted = None
+        self._icon_in_flight = None
         
         controls = ttk.Frame(self)
         controls.pack(fill='x', pady=(0, 5))
         
         self.third_party_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(controls, text="Third-party apps only", variable=self.third_party_var).pack(side='left')
+        # The checkbox must apply itself; before, toggling it did nothing
+        # until the user also pressed Refresh.
+        ttk.Checkbutton(controls, text="Third-party apps only",
+                        variable=self.third_party_var,
+                        command=self.refresh_apps).pack(side='left')
+        
+        self.online_icons_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Icons from Play Store",
+                        variable=self.online_icons_var).pack(side='left', padx=(10, 0))
         
         search_frame = ttk.Frame(controls)
         search_frame.pack(side='left', padx=10)
@@ -437,12 +839,19 @@ class AppManagerPanel(ttk.LabelFrame):
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=20)
         self.search_entry.pack(side='left', padx=5)
-        self.search_var.trace('w', self._on_search_change)
+        self.search_var.trace_add('write', self._on_search_change)
         
         ttk.Button(controls, text="Refresh", command=self.refresh_apps).pack(side='left', padx=5)
-        ttk.Button(controls, text="Install APK", command=self.install_apk).pack(side='left', padx=5)
-        ttk.Button(controls, text="Uninstall Selected", command=self.uninstall_selected).pack(side='left', padx=5)
-        ttk.Button(controls, text="Clear Data", command=self.clear_data_selected).pack(side='left', padx=5)
+        self.install_btn = ttk.Button(controls, text="Install APK", command=self.install_apk)
+        self.install_btn.pack(side='left', padx=5)
+        self.uninstall_btn = ttk.Button(controls, text="Uninstall Selected", command=self.uninstall_selected)
+        self.uninstall_btn.pack(side='left', padx=5)
+        # Reversible counterpart to Uninstall: disables the app in place
+        # instead of deleting it, and flips to "Unfreeze" for frozen apps.
+        self.freeze_btn = ttk.Button(controls, text="Freeze", command=self.freeze_selected)
+        self.freeze_btn.pack(side='left', padx=5)
+        self.clear_data_btn = ttk.Button(controls, text="Clear Data", command=self.clear_data_selected)
+        self.clear_data_btn.pack(side='left', padx=5)
         
         main_frame = ttk.Frame(self)
         main_frame.pack(fill='both', expand=True)
@@ -450,12 +859,13 @@ class AppManagerPanel(ttk.LabelFrame):
         list_frame = ttk.Frame(main_frame)
         list_frame.pack(side='left', fill='both', expand=True, padx=(0, 10))
         
-        columns = ('name',)
-        self.app_tree = ttk.Treeview(list_frame, columns=columns, show='tree headings')
-        self.app_tree.heading('#0', text='')
+        columns = ('name', 'state')
+        self.app_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
         self.app_tree.heading('name', text='App Name')
-        self.app_tree.column('#0', width=32, minwidth=32)
-        self.app_tree.column('name', width=300)
+        self.app_tree.heading('state', text='State')
+        self.app_tree.column('name', width=260)
+        self.app_tree.column('state', width=90, anchor='center')
+        self.app_tree.tag_configure('frozen', foreground='gray')
         self.app_tree.pack(fill='both', expand=True)
         
         self.app_tree.bind('<<TreeviewSelect>>', self._on_selection_change)
@@ -476,85 +886,164 @@ class AppManagerPanel(ttk.LabelFrame):
     
     def set_device(self, device_id):
         """Set the current device"""
+        if device_id == self.device_id:
+            return
         self.device_id = device_id
         self.icon_cache.clear()
         self.all_packages = []
+        self.frozen_packages = set()
+        with self._icon_lock:
+            self._icon_wanted = None
+        self._icon_token += 1
+        self._icon_in_flight = None
+        self.icon_label.config(image='', text="No icon")
+        self.detail_label.config(text="Select an app to see details")
         self.search_var.set('')
+        self._filter_apps()
         self.refresh_apps()
     
     def refresh_apps(self):
-        """Refresh the app list"""
-        for item in self.app_tree.get_children():
-            self.app_tree.delete(item)
-        
+        """Refresh the app list on the worker thread."""
         if not self.device_id:
+            self.all_packages = []
+            self._filter_apps()
             return
         
-        self.all_packages = self.adb.list_packages(self.device_id, self.third_party_var.get())
+        device_id = self.device_id
+        third_party = self.third_party_var.get()
+        self.runner.submit(
+            lambda: (self.adb.list_packages(device_id, third_party),
+                     set(self.adb.list_frozen_packages(device_id))),
+            lambda result: self._show_packages(result, device_id),
+            label="Listing apps"
+        )
+    
+    def _show_packages(self, result, device_id):
+        # Ignore a result that belongs to a device we have already left.
+        if device_id != self.device_id:
+            return
+        packages, frozen = result
+        self.all_packages = packages
+        self.frozen_packages = frozen
         self._filter_apps()
     
     def _filter_apps(self):
         """Filter apps based on search term"""
         search_term = self.search_var.get().lower()
+        selected = [self.app_tree.item(i, 'values')[0]
+                    for i in self.app_tree.selection()]
         for item in self.app_tree.get_children():
             self.app_tree.delete(item)
         
         packages = [p for p in self.all_packages if search_term in p.lower()]
         for pkg in packages:
-            self.app_tree.insert('', 'end', text='', values=(pkg,))
+            frozen = pkg in self.frozen_packages
+            self.app_tree.insert('', 'end', iid=pkg, values=(
+                pkg, '❄ Frozen' if frozen else ''),
+                tags=('frozen',) if frozen else ())
+        
+        # Keep whatever is still visible selected, so a refresh, a search
+        # keystroke or a freeze does not throw the selection away.
+        visible = set(packages)
+        restored = [p for p in selected if p in visible]
+        if restored:
+            self.app_tree.selection_set(restored)
+        self._update_freeze_button()
     
     def _on_search_change(self, *args):
         """Handle search text change"""
         self._filter_apps()
     
+    def _detail_text(self, pkg, suffix=''):
+        """Detail line for a package, including its frozen state."""
+        state = ' (frozen)' if pkg in self.frozen_packages else ''
+        return f"Package: {pkg}{state}{suffix}"
+    
+    def _update_freeze_button(self):
+        """Label the button with the state it would move the selection to."""
+        selection = self.app_tree.selection()
+        packages = [self.app_tree.item(i, 'values')[0] for i in selection]
+        if any(pkg in self.frozen_packages for pkg in packages):
+            self.freeze_btn.config(text='Unfreeze')
+        else:
+            self.freeze_btn.config(text='Freeze')
+    
     def _on_selection_change(self, event=None):
         """Handle selection change in app tree"""
         selection = self.app_tree.selection()
         if not selection:
+            self._icon_token += 1
+            self._icon_in_flight = None
             self.icon_label.config(image='', text="No icon")
             self.detail_label.config(text="Select an app to see details")
+            self._update_freeze_button()
             return
         
-        item = selection[0]
-        pkg = self.app_tree.item(item, 'values')[0]
-        
-        self.detail_label.config(text=f"Package: {pkg}")
+        pkg = self.app_tree.item(selection[0], 'values')[0]
+        self.detail_label.config(text=self._detail_text(pkg))
+        self._update_freeze_button()
         
         if pkg in self.icon_cache:
-            photo_img = self.icon_cache[pkg]
-            self.icon_label.config(image=photo_img, text="")
-        else:
-            self.icon_label.config(image='', text="Loading...")
-            self.after_idle(lambda: self._load_icon_async(pkg))
-    
-    def _load_icon_async(self, pkg):
-        """Load icon in background thread"""
-        def load():
-            img_data, error = self.adb.get_app_icon(self.device_id, pkg)
-            if error:
-                self.after(0, lambda: self.icon_label.config(image='', text="No icon"))
-                return
-            
-            try:
-                import io
-                img = Image.open(io.BytesIO(img_data))
-                img.thumbnail((DEFAULT_ICON_SIZE, DEFAULT_ICON_SIZE), Image.LANCZOS)
-                
-                if HAS_PIL:
-                    photo_img = ImageTk.PhotoImage(img)
-                else:
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                        img.save(f, format='PNG')
-                        temp_path = f.name
-                    photo_img = tk.PhotoImage(file=temp_path)
-                    os.unlink(temp_path)
-                
-                self.icon_cache[pkg] = photo_img
-                self.after(0, lambda: self.icon_label.config(image=photo_img, text=""))
-            except Exception as e:
-                self.after(0, lambda: self.icon_label.config(image='', text="No icon"))
+            self._icon_token += 1
+            self._icon_in_flight = None
+            self.icon_label.config(image=self.icon_cache[pkg], text="")
+            return
         
-        threading.Thread(target=load, daemon=True).start()
+        if self._icon_in_flight == pkg:
+            # Rebuilding the tree re-fires this event: keep waiting for the
+            # request already running rather than fetching the icon twice.
+            self.icon_label.config(image='', text="Loading...")
+            return
+        
+        self._icon_token += 1
+        token = self._icon_token
+        self._icon_in_flight = pkg
+        self.icon_label.config(image='', text="Loading...")
+        with self._icon_lock:
+            self._icon_wanted = pkg
+        # Tk vars are read here, on the Tk thread, never by the worker.
+        online = self.online_icons_var.get()
+        self.runner.submit(
+            lambda: self._fetch_icon(pkg, online),
+            lambda result: self._show_icon(pkg, token, result),
+            label="Loading icon"
+        )
+    
+    def _fetch_icon(self, pkg, online):
+        """Worker thread: skip superseded requests, then decode the icon."""
+        with self._icon_lock:
+            if self._icon_wanted != pkg:
+                return None, None
+        data, error = self.adb.get_app_icon(pkg, self.device_id)
+        if error and online:
+            with self._icon_lock:
+                if self._icon_wanted != pkg:
+                    return None, None
+            data, error = fetch_play_icon(pkg)
+        if error:
+            return None, error
+        decoded = decode_icon(data)
+        return (decoded, None) if decoded else (None, "unsupported image format")
+    
+    def _show_icon(self, pkg, token, result):
+        # A result that is no longer the newest one must not be displayed.
+        if token != self._icon_token:
+            return
+        self._icon_in_flight = None
+        data, error = result
+        if not data:
+            self.icon_label.config(image='', text="No icon")
+            reason = error or "device returned no image"
+            self.detail_label.config(
+                text=self._detail_text(pkg, f" — icon unavailable: {reason}"))
+            return
+        try:
+            photo = make_photo(data)
+        except tk.TclError:
+            self.icon_label.config(image='', text="No icon")
+            return
+        self.icon_cache[pkg] = photo
+        self.icon_label.config(image=photo, text="")
     
     def install_apk(self):
         """Install an APK file"""
@@ -568,12 +1057,21 @@ class AppManagerPanel(ttk.LabelFrame):
         )
         
         if apk_path:
-            output, success = self.adb.install_apk(apk_path, self.device_id)
-            if success:
-                messagebox.showinfo("Success", "APK installed successfully")
-                self.refresh_apps()
-            else:
-                messagebox.showerror("Error", f"Installation failed:\n{output}")
+            device_id = self.device_id
+            self.runner.submit(
+                lambda: self.adb.install_apk(apk_path, device_id),
+                self._after_install,
+                label="Installing APK",
+                widgets=[self.install_btn]
+            )
+    
+    def _after_install(self, result):
+        output, success = result
+        if success:
+            messagebox.showinfo("Success", "APK installed successfully")
+            self.refresh_apps()
+        else:
+            messagebox.showerror("Error", f"Installation failed:\n{output}")
     
     def uninstall_selected(self):
         """Uninstall selected apps"""
@@ -587,12 +1085,75 @@ class AppManagerPanel(ttk.LabelFrame):
             return
         
         packages = [self.app_tree.item(i, 'values')[0] for i in selected]
-        if messagebox.askyesno("Confirm", f"Uninstall {len(packages)} app(s)?"):
+        if not messagebox.askyesno("Confirm", f"Uninstall {len(packages)} app(s)?"):
+            return
+        
+        device_id = self.device_id
+        
+        def run():
+            failures = []
             for pkg in packages:
-                output, success = self.adb.uninstall_package(pkg, self.device_id)
+                output, success = self.adb.uninstall_package(pkg, device_id)
                 if not success:
-                    messagebox.showerror("Error", f"Failed to uninstall {pkg}:\n{output}")
-            self.refresh_apps()
+                    failures.append(f"Failed to uninstall {pkg}:\n{output}")
+            return failures
+        
+        self.runner.submit(run, self._after_uninstall, label="Uninstalling apps",
+                           widgets=[self.uninstall_btn])
+    
+    def _after_uninstall(self, failures):
+        if failures:
+            messagebox.showerror("Error", "\n\n".join(failures))
+        self.refresh_apps()
+    
+    def freeze_selected(self):
+        """Freeze or unfreeze the selected apps without touching their data.
+
+        The button states the end state every selected app moves to, so
+        repeated clicks are idempotent and no confirmation dialog is needed
+        for something that can always be undone with the same button.
+        """
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        
+        selected = self.app_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "No app selected")
+            return
+        
+        packages = [self.app_tree.item(i, 'values')[0] for i in selected]
+        freeze = self.freeze_btn.cget('text') == 'Freeze'
+        device_id = self.device_id
+        action = self.adb.freeze_package if freeze else self.adb.unfreeze_package
+        verb = 'freeze' if freeze else 'unfreeze'
+        
+        def run():
+            applied, failures = [], []
+            for pkg in packages:
+                output, success = action(pkg, device_id)
+                if success:
+                    applied.append(pkg)
+                else:
+                    failures.append(f"Failed to {verb} {pkg}:\n{output}")
+            return applied, failures
+        
+        self.runner.submit(
+            run,
+            lambda result: self._after_freeze(result, freeze),
+            label="Freezing apps" if freeze else "Unfreezing apps",
+            widgets=[self.freeze_btn])
+    
+    def _after_freeze(self, result, froze):
+        applied, failures = result
+        if froze:
+            self.frozen_packages.update(applied)
+        else:
+            self.frozen_packages.difference_update(applied)
+        self._filter_apps()
+        self._on_selection_change()
+        if failures:
+            messagebox.showerror("Error", "\n\n".join(failures))
     
     def clear_data_selected(self):
         """Clear data of selected apps"""
@@ -606,20 +1167,36 @@ class AppManagerPanel(ttk.LabelFrame):
             return
         
         packages = [self.app_tree.item(i, 'values')[0] for i in selected]
-        if messagebox.askyesno("Confirm", f"Clear data for {len(packages)} app(s)?"):
+        if not messagebox.askyesno("Confirm", f"Clear data for {len(packages)} app(s)?"):
+            return
+        
+        device_id = self.device_id
+        
+        def run():
+            failures = []
             for pkg in packages:
-                output, success = self.adb.clear_app_data(pkg, self.device_id)
+                output, success = self.adb.clear_app_data(pkg, device_id)
                 if not success:
-                    messagebox.showerror("Error", f"Failed to clear data for {pkg}:\n{output}")
+                    failures.append(f"Failed to clear data for {pkg}:\n{output}")
+            return failures
+        
+        self.runner.submit(run, self._after_clear_data, label="Clearing app data",
+                           widgets=[self.clear_data_btn])
+    
+    def _after_clear_data(self, failures):
+        if failures:
+            messagebox.showerror("Error", "\n\n".join(failures))
+        else:
             messagebox.showinfo("Success", "Data cleared")
 
 
 class FileManagerPanel(ttk.LabelFrame):
     """Panel for file management"""
     
-    def __init__(self, parent, adb):
+    def __init__(self, parent, adb, runner):
         super().__init__(parent, text="File Manager", padding=10)
         self.adb = adb
+        self.runner = runner
         self.device_id = None
         self.current_path = '/sdcard'
         
@@ -634,6 +1211,11 @@ class FileManagerPanel(ttk.LabelFrame):
         
         ttk.Button(path_frame, text="Go", command=lambda: self.navigate_to(self.path_var.get())).pack(side='left')
         ttk.Button(path_frame, text="↑ Up", command=self.go_up).pack(side='left', padx=5)
+        
+        # Listing failures (permission denied, bad path) are shown here
+        # instead of looking like an empty directory.
+        self.error_label = ttk.Label(self, text='', foreground='#b00020')
+        self.error_label.pack(fill='x', pady=(0, 5))
         
         list_frame = ttk.Frame(self)
         list_frame.pack(fill='both', expand=True)
@@ -658,57 +1240,103 @@ class FileManagerPanel(ttk.LabelFrame):
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill='x', pady=(5, 0))
         
-        ttk.Button(btn_frame, text="Refresh", command=self.refresh_files).pack(side='left', padx=2)
-        ttk.Button(btn_frame, text="Pull File", command=self.pull_file).pack(side='left', padx=2)
-        ttk.Button(btn_frame, text="Push File", command=self.push_file).pack(side='left', padx=2)
+        self.refresh_btn = ttk.Button(btn_frame, text="Refresh", command=self.refresh_files)
+        self.refresh_btn.pack(side='left', padx=2)
+        self.pull_btn = ttk.Button(btn_frame, text="Pull File", command=self.pull_file)
+        self.pull_btn.pack(side='left', padx=2)
+        self.push_btn = ttk.Button(btn_frame, text="Push File", command=self.push_file)
+        self.push_btn.pack(side='left', padx=2)
     
     def set_device(self, device_id):
         """Set the current device"""
+        if device_id == self.device_id:
+            return
         self.device_id = device_id
         self.current_path = '/sdcard'
         self.path_var.set(self.current_path)
         self.refresh_files()
     
     def refresh_files(self):
-        """Refresh the file list"""
-        for item in self.file_tree.get_children():
-            self.file_tree.delete(item)
-        
+        """Refresh the file list on the worker thread."""
         if not self.device_id:
+            self._populate([], None)
             return
         
-        files = self.adb.list_files(self.current_path, self.device_id)
+        path = self.current_path
+        device_id = self.device_id
+        self.runner.submit(
+            lambda: self.adb.list_files(path, device_id),
+            lambda result: self._show_files(result, path, device_id),
+            label=f"Listing {path}"
+        )
+    
+    def _show_files(self, result, path, device_id):
+        # Ignore results for a directory or device we have already left.
+        if path != self.current_path or device_id != self.device_id:
+            return
+        files, error = result
+        self._populate(files, error)
+    
+    def _populate(self, files, error=None):
+        for item in self.file_tree.get_children():
+            self.file_tree.delete(item)
         for f in files:
             icon = '📁 ' if f['is_dir'] else '📄 '
-            self.file_tree.insert('', tk.END, values=(
+            # The iid is the raw name: the displayed value carries an icon
+            # prefix that must never be parsed back out (lstrip would eat
+            # leading spaces and icon characters from real file names).
+            self.file_tree.insert('', tk.END, iid=f['name'], values=(
                 icon + f['name'],
                 f['size'],
                 f['permissions']
             ), tags=('dir' if f['is_dir'] else 'file',))
+        self.error_label.config(text=error or '')
     
     def navigate_to(self, path):
-        """Navigate to a specific path"""
+        """Navigate to a specific path, normalised before it is used."""
+        path = self._normalise_path(path)
+        if not path:
+            return
         self.current_path = path
         self.path_var.set(path)
         self.refresh_files()
     
+    def _normalise_path(self, path):
+        """Turn user input into an absolute device path, or '' if unusable.
+
+        Empty/whitespace input and `..` segments used to leave
+        `current_path` in a state where `go_up` could never recover.
+        """
+        path = (path or '').strip()
+        if not path:
+            return self.current_path if self.current_path else ''
+        if not path.startswith('/'):
+            path = posixpath.join(self.current_path, path)
+        normalised = posixpath.normpath(path)
+        return normalised if normalised != '.' else ''
+    
     def go_up(self):
         """Go to parent directory"""
-        parent = os.path.dirname(self.current_path.rstrip('/'))
+        parent = posixpath.dirname(self.current_path.rstrip('/'))
         if parent:
             self.navigate_to(parent)
+        elif self.current_path != '/':
+            # '/' has no parent; anything else (an empty or relative path
+            # handed down from older builds) recovers to the root instead
+            # of leaving the panel stuck with nowhere to go.
+            self.navigate_to('/')
     
     def on_double_click(self, event):
         """Handle double-click on item"""
         selection = self.file_tree.selection()
-        if selection:
-            item = self.file_tree.item(selection[0])
-            tags = item['tags']
-            name = item['values'][0].lstrip('📁📄 ')
-            
-            if 'dir' in tags:
-                new_path = os.path.join(self.current_path, name)
-                self.navigate_to(new_path)
+        if not selection:
+            return
+        # The iid is the raw name; the displayed value has an icon prefix
+        # that must not be parsed back out.
+        name = selection[0]
+        tags = self.file_tree.item(selection[0], 'tags')
+        if 'dir' in tags:
+            self.navigate_to(posixpath.join(self.current_path, name))
     
     def pull_file(self):
         """Pull selected file from device"""
@@ -721,9 +1349,8 @@ class FileManagerPanel(ttk.LabelFrame):
             messagebox.showwarning("Warning", "No file selected")
             return
         
-        item = self.file_tree.item(selection[0])
-        name = item['values'][0].lstrip('📁📄 ')
-        remote_path = os.path.join(self.current_path, name)
+        name = selection[0]
+        remote_path = posixpath.join(self.current_path, name)
         
         local_path = filedialog.asksaveasfilename(
             title="Save file as",
@@ -731,11 +1358,20 @@ class FileManagerPanel(ttk.LabelFrame):
         )
         
         if local_path:
-            output, success = self.adb.pull_file(remote_path, local_path, self.device_id)
-            if success:
-                messagebox.showinfo("Success", f"File saved to {local_path}")
-            else:
-                messagebox.showerror("Error", f"Pull failed:\n{output}")
+            device_id = self.device_id
+            self.runner.submit(
+                lambda: self.adb.pull_file(remote_path, local_path, device_id),
+                lambda result: self._after_pull(result, local_path),
+                label="Pulling file",
+                widgets=[self.pull_btn]
+            )
+    
+    def _after_pull(self, result, local_path):
+        output, success = result
+        if success:
+            messagebox.showinfo("Success", f"File saved to {local_path}")
+        else:
+            messagebox.showerror("Error", f"Pull failed:\n{output}")
     
     def push_file(self):
         """Push a file to device"""
@@ -747,22 +1383,35 @@ class FileManagerPanel(ttk.LabelFrame):
         
         if local_path:
             filename = os.path.basename(local_path)
-            remote_path = os.path.join(self.current_path, filename)
+            remote_path = posixpath.join(self.current_path, filename)
+            device_id = self.device_id
             
-            output, success = self.adb.push_file(local_path, remote_path, self.device_id)
-            if success:
-                messagebox.showinfo("Success", f"File pushed to {remote_path}")
-                self.refresh_files()
-            else:
-                messagebox.showerror("Error", f"Push failed:\n{output}")
+            def run():
+                return self.adb.push_file(local_path, remote_path, device_id), remote_path
+            
+            self.runner.submit(
+                run,
+                self._after_push,
+                label="Pushing file",
+                widgets=[self.push_btn]
+            )
+    
+    def _after_push(self, result):
+        (output, success), remote_path = result
+        if success:
+            messagebox.showinfo("Success", f"File pushed to {remote_path}")
+            self.refresh_files()
+        else:
+            messagebox.showerror("Error", f"Push failed:\n{output}")
 
 
 class ShellPanel(ttk.LabelFrame):
     """Panel for shell command execution"""
     
-    def __init__(self, parent, adb):
+    def __init__(self, parent, adb, runner):
         super().__init__(parent, text="Shell", padding=10)
         self.adb = adb
+        self.runner = runner
         self.device_id = None
         self.command_history = []
         self.history_index = -1
@@ -787,6 +1436,8 @@ class ShellPanel(ttk.LabelFrame):
     
     def set_device(self, device_id):
         """Set the current device"""
+        if device_id == self.device_id:
+            return
         self.device_id = device_id
         self.clear_output()
         if device_id:
@@ -821,11 +1472,13 @@ class ShellPanel(ttk.LabelFrame):
         self.append_output(f"$ {command}\n")
         self.cmd_var.set('')
         
-        def run():
-            result, success = self.adb.run_shell_command(command, self.device_id)
-            self.after(0, lambda result=result: self.append_output(result + "\n"))
-        
-        threading.Thread(target=run, daemon=True).start()
+        # Queue instead of spawning a thread per Enter, so a burst of
+        # commands cannot create an unbounded number of adb children.
+        self.runner.submit(
+            lambda: self.adb.run_shell_command(command, self.device_id)[0],
+            lambda output: self.append_output(output + "\n"),
+            label="Running command"
+        )
     
     def history_up(self, event):
         """Navigate command history up"""
@@ -846,12 +1499,15 @@ class ShellPanel(ttk.LabelFrame):
 class ToolsPanel(ttk.LabelFrame):
     """Panel for various tools"""
     
-    def __init__(self, parent, adb):
+    def __init__(self, parent, adb, runner):
         super().__init__(parent, text="Tools", padding=10)
         self.adb = adb
+        self.runner = runner
         self.device_id = None
         
-        ttk.Button(self, text="📷 Take Screenshot", command=self.take_screenshot).pack(fill='x', pady=2)
+        self.screenshot_btn = ttk.Button(
+            self, text="📷 Take Screenshot", command=self.take_screenshot)
+        self.screenshot_btn.pack(fill='x', pady=2)
         
         ttk.Separator(self, orient='horizontal').pack(fill='x', pady=5)
         ttk.Label(self, text="Reboot Options:").pack(anchor='w')
@@ -859,9 +1515,14 @@ class ToolsPanel(ttk.LabelFrame):
         reboot_frame = ttk.Frame(self)
         reboot_frame.pack(fill='x')
         
-        ttk.Button(reboot_frame, text="🔄 Reboot", command=lambda: self.reboot('')).pack(side='left', padx=2)
-        ttk.Button(reboot_frame, text="⚙️ Recovery", command=lambda: self.reboot('recovery')).pack(side='left', padx=2)
-        ttk.Button(reboot_frame, text="🔧 Bootloader", command=lambda: self.reboot('bootloader')).pack(side='left', padx=2)
+        self.reboot_btns = []
+        for text, mode in (("🔄 Reboot", ''),
+                           ("⚙️ Recovery", 'recovery'),
+                           ("🔧 Bootloader", 'bootloader')):
+            button = ttk.Button(reboot_frame, text=text,
+                                command=lambda m=mode: self.reboot(m))
+            button.pack(side='left', padx=2)
+            self.reboot_btns.append(button)
     
     def set_device(self, device_id):
         """Set the current device"""
@@ -882,11 +1543,20 @@ class ToolsPanel(ttk.LabelFrame):
         )
         
         if save_path:
-            output, success = self.adb.take_screenshot(save_path, self.device_id)
-            if success:
-                messagebox.showinfo("Success", f"Screenshot saved to {save_path}")
-            else:
-                messagebox.showerror("Error", f"Screenshot failed:\n{output}")
+            device_id = self.device_id
+            self.runner.submit(
+                lambda: self.adb.take_screenshot(save_path, device_id),
+                lambda result: self._after_screenshot(result, save_path),
+                label="Taking screenshot",
+                widgets=[self.screenshot_btn]
+            )
+    
+    def _after_screenshot(self, result, save_path):
+        output, success = result
+        if success:
+            messagebox.showinfo("Success", f"Screenshot saved to {save_path}")
+        else:
+            messagebox.showerror("Error", f"Screenshot failed:\n{output}")
     
     def reboot(self, mode):
         """Reboot the device"""
@@ -895,21 +1565,44 @@ class ToolsPanel(ttk.LabelFrame):
             return
         
         mode_name = mode if mode else "normal"
-        if messagebox.askyesno("Confirm", f"Reboot device to {mode_name} mode?"):
-            output, success = self.adb.reboot(mode, self.device_id)
-            if not success:
-                messagebox.showerror("Error", f"Reboot failed:\n{output}")
+        if not messagebox.askyesno("Confirm", f"Reboot device to {mode_name} mode?"):
+            return
+        
+        device_id = self.device_id
+        self.runner.submit(
+            lambda: self.adb.reboot(mode, device_id),
+            self._after_reboot,
+            label=f"Rebooting to {mode_name}",
+            widgets=self.reboot_btns
+        )
+    
+    def _after_reboot(self, result):
+        output, success = result
+        if not success:
+            messagebox.showerror("Error", f"Reboot failed:\n{output}")
 
 
 class LogcatPanel(ttk.LabelFrame):
     """Panel for viewing logcat"""
     
-    def __init__(self, parent, adb):
+    # threadtime (the Android default): 01-15 12:34:56.789  1234  1234 W Tag : msg
+    # brief:                            W/Tag( 1234): msg
+    LEVEL_PATTERN = re.compile(
+        r'^(?:\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\d+\s+)?'
+        r'([VDIWEF])(?:/|\s)')
+    MAX_LINES = 5000
+    FILTER_DELAY_MS = 150
+    TRIM_DELAY_MS = 250
+
+    def __init__(self, parent, adb, runner):
         super().__init__(parent, text="Logcat", padding=10)
         self.adb = adb
+        self.runner = runner
         self.device_id = None
         self.is_running = False
         self.process = None
+        self.lines = []
+        self._filter_job = None
         
         controls = ttk.Frame(self)
         controls.pack(fill='x', pady=(0, 5))
@@ -937,12 +1630,38 @@ class LogcatPanel(ttk.LabelFrame):
         self.log_text.tag_config('W', foreground='orange')
         self.log_text.tag_config('E', foreground='red')
         self.log_text.tag_config('F', foreground='red', background='yellow')
+        self.filter_var.trace_add('write', self._on_filter_change)
     
     def set_device(self, device_id):
         """Set the current device"""
+        if device_id == self.device_id:
+            return
         self.stop_logcat()
         self.device_id = device_id
         self.clear_log()
+    
+    def close(self):
+        """Make sure no adb logcat child outlives the window."""
+        self.is_running = False
+        if self._filter_job:
+            self.after_cancel(self._filter_job)
+            self._filter_job = None
+        process, self.process = self.process, None
+        if process:
+            self._reap(process)
+    
+    @staticmethod
+    def _reap(process):
+        """Terminate a logcat child and wait for it to actually exit."""
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
+                pass
     
     def start_logcat(self):
         """Start logcat capture"""
@@ -957,64 +1676,113 @@ class LogcatPanel(ttk.LabelFrame):
         self.start_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
         
+        device_id = self.device_id
+        
         def read_logcat():
-            cmd = [self.adb.adb_path, '-s', self.device_id, 'logcat']
-            filter_text = self.filter_var.get()
-            if filter_text:
-                cmd.extend(['-s', filter_text])
-            
+            cmd = [self.adb.adb_path, '-s', device_id, 'logcat']
+            process = None
             try:
-                self.process = subprocess.Popen(
+                process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1
                 )
+                self.process = process
+                # Stop (or a device change) may have hit us while starting.
+                if not self.is_running:
+                    process.terminate()
                 
-                while self.is_running and self.process.poll() is None:
-                    line = self.process.stdout.readline()
+                while self.is_running and process.poll() is None:
+                    line = process.stdout.readline()
                     if line:
-                        self.after(0, lambda l=line: self.append_log(l))
+                        self.runner.post(self.append_log, line)
             except Exception as e:
-                error_msg = f"Error: {e}\n"
-                self.after(0, lambda msg=error_msg: self.append_log(msg))
+                self.runner.post(self.append_log, f"Error: {e}\n")
             finally:
-                self.after(0, self._on_logcat_stopped)
+                if process is not None:
+                    self._reap(process)
+                if self.process is process:
+                    self.process = None
+                self.runner.post(self._on_logcat_stopped)
         
         threading.Thread(target=read_logcat, daemon=True).start()
     
     def stop_logcat(self):
         """Stop logcat capture"""
         self.is_running = False
-        if self.process:
+        process, self.process = self.process, None
+        if process:
             try:
-                self.process.terminate()
+                process.terminate()
             except Exception:
                 pass
-            self.process = None
     
     def _on_logcat_stopped(self):
         """Handle logcat stopped"""
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
     
+    def _on_filter_change(self, *args):
+        """Re-render the buffer shortly after typing stops."""
+        if self._filter_job:
+            self.after_cancel(self._filter_job)
+        self._filter_job = self.after(self.FILTER_DELAY_MS, self._rerender)
+    
+    def _schedule_trim_render(self):
+        """Coalesce overflow re-renders.
+
+        A busy logcat trims on nearly every line; re-rendering the whole
+        buffer each time costs more than the flood itself and freezes the
+        UI, so at most one render is ever pending.
+        """
+        if self._filter_job is None:
+            self._filter_job = self.after(self.TRIM_DELAY_MS, self._rerender)
+    
+    def _filter_text(self):
+        return self.filter_var.get().strip().lower()
+    
+    def _matches(self, text):
+        needle = self._filter_text()
+        return not needle or needle in text.lower()
+    
     def append_log(self, text):
-        """Append text to log with color coding"""
+        """Store a logcat line and show it when it passes the filter."""
+        self.lines.append(text)
+        if len(self.lines) > self.MAX_LINES:
+            del self.lines[:-self.MAX_LINES]
+            self._schedule_trim_render()
+        elif self._matches(text):
+            self._insert(text)
+    
+    def _rerender(self, *args):
+        """Redraw the whole buffer under the current filter."""
+        self._filter_job = None
         self.log_text.config(state='normal')
-        
-        tag = None
-        if len(text) > 0:
-            match = re.match(r'^([VDIWEF])/', text)
-            if match:
-                tag = match.group(1)
-        
-        self.log_text.insert(tk.END, text, tag)
+        self.log_text.delete('1.0', tk.END)
+        for line in self.lines:
+            if self._matches(line):
+                self._insert_locked(line)
         self.log_text.see(tk.END)
         self.log_text.config(state='disabled')
     
+    def _insert(self, text):
+        self.log_text.config(state='normal')
+        self._insert_locked(text)
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+    
+    def _insert_locked(self, text):
+        match = self.LEVEL_PATTERN.match(text)
+        self.log_text.insert(tk.END, text, match.group(1) if match else None)
+    
     def clear_log(self):
         """Clear the log"""
+        self.lines = []
+        if self._filter_job:
+            self.after_cancel(self._filter_job)
+            self._filter_job = None
         self.log_text.config(state='normal')
         self.log_text.delete('1.0', tk.END)
         self.log_text.config(state='disabled')
@@ -1030,11 +1798,17 @@ class ADBGUI(tk.Tk):
         self.geometry("1200x700")
         
         self.adb = ADBWrapper()
+        self._device_text = "Ready"
+        self._busy_label = None
+        self._closing = False
+        self._last_device_id = None
+        self.runner = TaskRunner(self, on_status=self._on_busy_status)
         
         main_container = ttk.Frame(self, padding=10)
         main_container.pack(fill='both', expand=True)
         
-        self.device_panel = DevicePanel(main_container, self.adb, self.on_device_change)
+        self.device_panel = DevicePanel(main_container, self.adb, self.runner,
+                                        self.on_device_change)
         self.device_panel.pack(fill='x', pady=(0, 10))
         
         self.notebook = ttk.Notebook(main_container)
@@ -1052,15 +1826,40 @@ class ADBGUI(tk.Tk):
         status_bar.pack(fill='x', pady=(10, 0))
         
         self.device_panel.refresh_devices()
-        
-        self.after(5000, self.periodic_refresh)
+        self._start_device_tracking()
+        # Without this the title-bar close is Tk's default, which never runs
+        # the teardown below and leaves an `adb logcat` child running.
+        self.protocol('WM_DELETE_WINDOW', self.destroy)
+        # Interpreter exit (Ctrl-C, an exception before mainloop, a script
+        # that forgets to destroy) must not leave adb children behind either.
+        atexit.register(self.destroy)
+    
+    def destroy(self):
+        """Shut background work down before the window goes away."""
+        self._closing = True
+        if getattr(self, '_window_gone', False):
+            return
+        if not getattr(self, '_torn_down', False):
+            self._torn_down = True
+            if hasattr(self, 'logcat_panel'):
+                # Kills the logcat child and cancels this panel's own timers.
+                # Never cancel timers from the root instead: after_cancel
+                # deletes the Tcl command globally while the panel still
+                # lists it, and the panel's own destroy then fails.
+                self.logcat_panel.close()
+            if hasattr(self, 'adb'):
+                self.adb.stop_tracking()
+            if hasattr(self, 'runner'):
+                self.runner.close()
+        super().destroy()
+        self._window_gone = True
     
     def create_info_tab(self):
         """Create device info tab"""
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text="Device Info")
         
-        self.info_panel = DeviceInfoPanel(frame, self.adb)
+        self.info_panel = DeviceInfoPanel(frame, self.adb, self.runner)
         self.info_panel.pack(fill='both', expand=True)
     
     def create_apps_tab(self):
@@ -1068,7 +1867,7 @@ class ADBGUI(tk.Tk):
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text="Apps")
         
-        self.apps_panel = AppManagerPanel(frame, self.adb)
+        self.apps_panel = AppManagerPanel(frame, self.adb, self.runner)
         self.apps_panel.pack(fill='both', expand=True)
     
     def create_files_tab(self):
@@ -1076,7 +1875,7 @@ class ADBGUI(tk.Tk):
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text="Files")
         
-        self.files_panel = FileManagerPanel(frame, self.adb)
+        self.files_panel = FileManagerPanel(frame, self.adb, self.runner)
         self.files_panel.pack(fill='both', expand=True)
     
     def create_shell_tab(self):
@@ -1084,7 +1883,7 @@ class ADBGUI(tk.Tk):
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text="Shell")
         
-        self.shell_panel = ShellPanel(frame, self.adb)
+        self.shell_panel = ShellPanel(frame, self.adb, self.runner)
         self.shell_panel.pack(fill='both', expand=True)
     
     def create_logcat_tab(self):
@@ -1092,7 +1891,7 @@ class ADBGUI(tk.Tk):
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text="Logcat")
         
-        self.logcat_panel = LogcatPanel(frame, self.adb)
+        self.logcat_panel = LogcatPanel(frame, self.adb, self.runner)
         self.logcat_panel.pack(fill='both', expand=True)
     
     def create_tools_tab(self):
@@ -1100,27 +1899,80 @@ class ADBGUI(tk.Tk):
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text="Tools")
         
-        self.tools_panel = ToolsPanel(frame, self.adb)
+        self.tools_panel = ToolsPanel(frame, self.adb, self.runner)
         self.tools_panel.pack(fill='both', expand=True)
     
     def on_device_change(self, device_id):
-        """Handle device selection change"""
-        self.info_panel.set_device(device_id)
-        self.apps_panel.set_device(device_id)
-        self.files_panel.set_device(device_id)
-        self.shell_panel.set_device(device_id)
-        self.logcat_panel.set_device(device_id)
-        self.tools_panel.set_device(device_id)
+        """Handle a device selection or device state change.
+
+        A new device resets every panel. The same device reporting a new
+        state (e.g. unauthorized -> device) only reloads data, so shell
+        output, a running logcat and the current directory survive.
+        """
+        if device_id == self._last_device_id:
+            self.info_panel.refresh_info()
+            self.apps_panel.refresh_apps()
+            self.files_panel.refresh_files()
+        else:
+            self._last_device_id = device_id
+            self.info_panel.set_device(device_id)
+            self.apps_panel.set_device(device_id)
+            self.files_panel.set_device(device_id)
+            self.shell_panel.set_device(device_id)
+            self.logcat_panel.set_device(device_id)
+            self.tools_panel.set_device(device_id)
         
         if device_id:
-            self.status_var.set(f"Connected to: {device_id}")
+            self._device_text = f"Connected to: {device_id}"
         else:
-            self.status_var.set("No device connected")
+            self._device_text = "No device connected"
+        self._update_status()
     
-    def periodic_refresh(self):
-        """Periodically refresh device list"""
+    def _on_busy_status(self, label):
+        """Receive the label of the job the runner is working on (or None)."""
+        self._busy_label = label
+        self._update_status()
+    
+    def _update_status(self):
+        if not hasattr(self, 'status_var') or self._closing:
+            return
+        text = self._device_text
+        if self._busy_label:
+            text = f"{text} — {self._busy_label}…"
+        self.status_var.set(text)
+    
+    def _start_device_tracking(self):
+        """Follow `adb track-devices` so the list updates the instant it changes."""
+        def watch():
+            delay = 2.0
+            misses = 0
+            while not self._closing:
+                framed = self.adb.track_devices(self._on_devices_changed)
+                if self._closing:
+                    return
+                if framed:
+                    misses, delay = 0, 2.0
+                else:
+                    misses += 1
+                    if misses >= 3:
+                        self.runner.post(self._poll_devices)
+                        return
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+        
+        threading.Thread(target=watch, name='device-tracker', daemon=True).start()
+    
+    def _on_devices_changed(self):
+        """Called from the tracker thread; marshal onto the Tk thread."""
+        self.runner.post(self.device_panel.refresh_devices)
+    
+    def _poll_devices(self):
+        """Fallback used only when `adb track-devices` is unavailable."""
+        if self._closing:
+            return
         self.device_panel.refresh_devices()
-        self.after(5000, self.periodic_refresh)
+        if not self._closing:
+            self.after(5000, self._poll_devices)
 
 
 def main():
