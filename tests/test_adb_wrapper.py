@@ -1,97 +1,33 @@
 #!/usr/bin/env python3
 """
-Unit tests for ADB GUI - Testing the ADBWrapper class
-These tests mock the subprocess calls to test the wrapper functionality
+Tests for the real ADBWrapper in adb_gui.
+
+This file used to contain a private copy of ADBWrapper "so it could be
+tested without tkinter", which meant every test here passed against a
+second implementation while the shipped one could be broken. It now
+imports the real class; `import adb_gui` only needs tkinter to be
+present, not a display.
 """
 
-import unittest
-from unittest.mock import patch, MagicMock
-import sys
 import os
+import sys
+import unittest
+from unittest.mock import MagicMock, patch
 
 # Add the parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-class ADBWrapper:
-    """Copy of ADBWrapper class for testing without tkinter dependency"""
-    
-    def __init__(self):
-        self.adb_path = self._find_adb()
-    
-    def _find_adb(self):
-        """Find ADB executable in PATH or common locations"""
-        import shutil
-        adb_in_path = shutil.which('adb')
-        if adb_in_path:
-            return adb_in_path
-        return 'adb'
-    
-    def run_command(self, *args, timeout=30):
-        """Run an ADB command and return the output"""
-        import subprocess
-        cmd = [self.adb_path] + list(args)
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return result.stdout + result.stderr, result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return "Command timed out", False
-        except FileNotFoundError:
-            return "ADB not found. Please install Android SDK Platform Tools.", False
-        except Exception as e:
-            return str(e), False
-    
-    def get_devices(self):
-        """Get list of connected devices"""
-        output, success = self.run_command('devices', '-l')
-        if not success:
-            return []
-        
-        devices = []
-        lines = output.strip().split('\n')[1:]
-        for line in lines:
-            if line.strip():
-                parts = line.split()
-                if len(parts) >= 2:
-                    device_id = parts[0]
-                    status = parts[1]
-                    model = ""
-                    for part in parts:
-                        if part.startswith('model:'):
-                            model = part.replace('model:', '')
-                            break
-                    devices.append({
-                        'id': device_id,
-                        'status': status,
-                        'model': model
-                    })
-        return devices
-    
-    def list_packages(self, device_id=None, third_party_only=True):
-        """List installed packages"""
-        prefix = ['-s', device_id] if device_id else []
-        args = prefix + ['shell', 'pm', 'list', 'packages']
-        if third_party_only:
-            args.append('-3')
-        
-        output, success = self.run_command(*args)
-        if not success:
-            return []
-        
-        packages = []
-        for line in output.strip().split('\n'):
-            if line.startswith('package:'):
-                packages.append(line.replace('package:', ''))
-        return sorted(packages)
+from adb_gui import ADBWrapper, parse_device_list  # noqa: E402
 
 
 class TestADBWrapper(unittest.TestCase):
-    """Test cases for ADBWrapper class"""
-    
+    """Test cases for the shipped ADBWrapper class"""
+
     def setUp(self):
         """Set up test fixtures"""
         self.adb = ADBWrapper()
-    
+        self.assertIsInstance(self.adb, ADBWrapper)
+
     @patch('subprocess.run')
     def test_get_devices_with_devices(self, mock_run):
         """Test get_devices with connected devices"""
@@ -103,16 +39,16 @@ def67890       device usb:456 product:device model:Galaxy_S21 device:samsung
 """
         mock_result.stderr = ""
         mock_run.return_value = mock_result
-        
+
         devices = self.adb.get_devices()
-        
+
         self.assertEqual(len(devices), 2)
         self.assertEqual(devices[0]['id'], 'abc12345')
         self.assertEqual(devices[0]['status'], 'device')
         self.assertEqual(devices[0]['model'], 'Pixel_5')
         self.assertEqual(devices[1]['id'], 'def67890')
         self.assertEqual(devices[1]['model'], 'Galaxy_S21')
-    
+
     @patch('subprocess.run')
     def test_get_devices_no_devices(self, mock_run):
         """Test get_devices with no connected devices"""
@@ -121,11 +57,11 @@ def67890       device usb:456 product:device model:Galaxy_S21 device:samsung
         mock_result.stdout = "List of devices attached\n"
         mock_result.stderr = ""
         mock_run.return_value = mock_result
-        
+
         devices = self.adb.get_devices()
-        
+
         self.assertEqual(len(devices), 0)
-    
+
     @patch('subprocess.run')
     def test_get_devices_unauthorized(self, mock_run):
         """Test get_devices with unauthorized device"""
@@ -136,12 +72,12 @@ abc12345       unauthorized
 """
         mock_result.stderr = ""
         mock_run.return_value = mock_result
-        
+
         devices = self.adb.get_devices()
-        
+
         self.assertEqual(len(devices), 1)
         self.assertEqual(devices[0]['status'], 'unauthorized')
-    
+
     @patch('subprocess.run')
     def test_list_packages(self, mock_run):
         """Test list_packages"""
@@ -153,14 +89,18 @@ package:com.test.app3
 """
         mock_result.stderr = ""
         mock_run.return_value = mock_result
-        
+
         packages = self.adb.list_packages('device123')
-        
+
         self.assertEqual(len(packages), 3)
         self.assertIn('com.example.app1', packages)
         self.assertIn('com.example.app2', packages)
         self.assertIn('com.test.app3', packages)
-    
+        # The call itself must select the device and the -3 filter.
+        sent = mock_run.call_args[0][0]
+        self.assertEqual(sent[1:3], ['-s', 'device123'])
+        self.assertIn('-3', sent)
+
     @patch('subprocess.run')
     def test_run_command_success(self, mock_run):
         """Test run_command success"""
@@ -169,12 +109,12 @@ package:com.test.app3
         mock_result.stdout = "success"
         mock_result.stderr = ""
         mock_run.return_value = mock_result
-        
+
         output, success = self.adb.run_command('version')
-        
+
         self.assertTrue(success)
         self.assertEqual(output, "success")
-    
+
     @patch('subprocess.run')
     def test_run_command_failure(self, mock_run):
         """Test run_command failure"""
@@ -183,83 +123,88 @@ package:com.test.app3
         mock_result.stdout = ""
         mock_result.stderr = "error message"
         mock_run.return_value = mock_result
-        
+
         output, success = self.adb.run_command('invalid_command')
-        
+
         self.assertFalse(success)
         self.assertIn("error message", output)
-    
+
     @patch('subprocess.run')
     def test_run_command_timeout(self, mock_run):
         """Test run_command timeout"""
         import subprocess
         mock_run.side_effect = subprocess.TimeoutExpired(cmd='adb', timeout=30)
-        
+
         output, success = self.adb.run_command('long_running_command')
-        
+
         self.assertFalse(success)
         self.assertIn("timed out", output)
-    
+
     @patch('subprocess.run')
     def test_run_command_not_found(self, mock_run):
         """Test run_command when ADB is not found"""
         mock_run.side_effect = FileNotFoundError()
-        
+
         output, success = self.adb.run_command('version')
-        
+
         self.assertFalse(success)
         self.assertIn("not found", output.lower())
 
+    @patch('subprocess.run')
+    def test_run_command_survives_undecodable_output(self, mock_run):
+        """A device answering in non-UTF-8 must not break the command."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = None
+        mock_result.stderr = None
+        # Simulate what subprocess does with errors='replace'.
+        mock_run.return_value = mock_result
+        mock_run.side_effect = None
+
+        def run(cmd, **kwargs):
+            self.assertEqual(kwargs.get('errors'), 'replace')
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = 'ok\ufffddef'
+            result.stderr = ''
+            return result
+
+        mock_run.side_effect = run
+
+        output, success = self.adb.run_command('shell', 'ls')
+
+        self.assertTrue(success)
+        self.assertIn('\ufffd', output)
+
 
 class TestPackageParsing(unittest.TestCase):
-    """Test package name parsing"""
-    
+    """Package name parsing lives in one place: ADBWrapper._package_names."""
+
     def test_parse_package_names(self):
-        """Test parsing package names from pm list packages output"""
         output = """package:com.android.settings
 package:com.google.android.apps.maps
 package:org.example.myapp
 """
-        packages = []
-        for line in output.strip().split('\n'):
-            if line.startswith('package:'):
-                packages.append(line.replace('package:', ''))
-        
-        self.assertEqual(len(packages), 3)
-        self.assertEqual(packages[0], 'com.android.settings')
-        self.assertEqual(packages[1], 'com.google.android.apps.maps')
-        self.assertEqual(packages[2], 'org.example.myapp')
+        self.assertEqual(
+            ADBWrapper._package_names(output),
+            ['com.android.settings', 'com.google.android.apps.maps',
+             'org.example.myapp'])
+
+    def test_non_package_lines_are_ignored(self):
+        output = "Error: failure\npackage:com.x\n"
+        self.assertEqual(ADBWrapper._package_names(output), ['com.x'])
 
 
 class TestDeviceParsing(unittest.TestCase):
-    """Test device parsing"""
-    
+    """Device list parsing lives in parse_device_list."""
+
     def test_parse_devices_output(self):
-        """Test parsing devices output"""
         output = """List of devices attached
 emulator-5554          device product:sdk_gphone_x86 model:sdk_gphone_x86 device:generic_x86 transport_id:1
 192.168.1.100:5555     device product:q2q model:SM_F916B device:q2q transport_id:2
 """
-        lines = output.strip().split('\n')[1:]
-        devices = []
-        
-        for line in lines:
-            if line.strip():
-                parts = line.split()
-                if len(parts) >= 2:
-                    device_id = parts[0]
-                    status = parts[1]
-                    model = ""
-                    for part in parts:
-                        if part.startswith('model:'):
-                            model = part.replace('model:', '')
-                            break
-                    devices.append({
-                        'id': device_id,
-                        'status': status,
-                        'model': model
-                    })
-        
+        devices = parse_device_list(output)
+
         self.assertEqual(len(devices), 2)
         self.assertEqual(devices[0]['id'], 'emulator-5554')
         self.assertEqual(devices[0]['model'], 'sdk_gphone_x86')
