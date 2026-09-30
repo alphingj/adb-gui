@@ -96,9 +96,14 @@ View comprehensive device information including:
 - App icons, optionally fetched from the Play Store
 - Install APK files from your computer
 - Uninstall selected applications
-- **Freeze / Unfreeze**: disables an app in place with `pm disable-user`
+- **Disable / Enable**: disables an app in place with `pm disable-user`
   instead of uninstalling it — the app stays installed, its data and
-  version are untouched, and the same button reverses it
+  version are untouched, and the same action reverses it
+- Multi-select, then press `D` to disable or `E` to enable everything
+  selected (the toolbar button and the right-click menu offer the same
+  actions)
+- Right-click a row to open the action menu (Disable, Enable, Clear
+  Data, Uninstall); a right-click selects the row under the cursor
 - Clear an app's data
 
 ### Files Tab

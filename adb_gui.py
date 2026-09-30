@@ -415,8 +415,12 @@ class ADBWrapper:
         spaces, so an unquoted path containing spaces lists nothing.
         """
         prefix = ['-s', device_id] if device_id else []
+        # A trailing slash makes `ls` dereference a symlinked directory
+        # (`/sdcard` is one on modern Android): without it the listing is a
+        # single row describing the link instead of the directory's contents.
+        listing_path = path if path.endswith('/') else path + '/'
         output, success = self.run_command(
-            *prefix, 'shell', 'ls -la ' + shlex.quote(path))
+            *prefix, 'shell', 'ls -la ' + shlex.quote(listing_path))
         if not success:
             lines = [line for line in output.splitlines() if line.strip()]
             return [], lines[-1] if lines else f'Cannot list {path}'
@@ -426,17 +430,34 @@ class ADBWrapper:
             line = line.rstrip('\r')
             if not line:
                 continue
-            # maxsplit keeps the rest of the line intact, so names with
-            # spaces survive (split() would collapse them).
-            parts = line.split(' ', 7)
-            if len(parts) < 8:
+            head = line.split(None, 1)
+            if not head:
                 continue
-            permissions = parts[0]
+            if '?' in head[0]:
+                # toybox masks every field it may not stat as `?`, and the
+                # date and time collapse into one column, so the name
+                # follows six fields here instead of seven. Parsing those
+                # rows the normal way shifts the columns and two masked
+                # rows can end up with the same name (crashing the tree).
+                fields = line.split(None, 6)
+                if len(fields) < 7:
+                    continue
+                permissions, name, size = fields[0], fields[6], fields[4]
+            else:
+                # maxsplit with None as the separator splits on runs of
+                # whitespace: `ls` pads the size column with several spaces,
+                # and those must count as one separator. The remainder after
+                # the seventh field is the name, spaces inside it included.
+                fields = line.split(None, 7)
+                if len(fields) < 8:
+                    continue
+                permissions, name, size = fields[0], fields[7], fields[4]
             # Rows are 10-character permission strings; `total 4` and any
             # stray error text are not, so they cannot parse as entries.
-            if len(permissions) != 10 or permissions[0] not in 'dcbpls-':
+            # A fully masked first character still counts: better a row
+            # with `?` metadata than no row at all.
+            if len(permissions) != 10 or permissions[0] not in 'dcbpls-?':
                 continue
-            name = parts[7]
             # Symlinks print as `name -> target`; split that off, but only
             # for symlinks, so a regular file called `a -> b` is kept whole.
             if permissions[0] == 'l' and ' -> ' in name:
@@ -446,7 +467,12 @@ class ADBWrapper:
             files.append({
                 'name': name,
                 'is_dir': permissions.startswith('d'),
-                'size': parts[4],
+                # A symlink may well point at a directory (`/sdcard` does);
+                # `ls` cannot tell us, so mark it and let a double-click
+                # try the listing — a file target then reports "Not a
+                # directory" instead of doing nothing.
+                'is_link': permissions.startswith('l'),
+                'size': size,
                 'permissions': permissions
             })
         return files, None
@@ -847,8 +873,9 @@ class AppManagerPanel(ttk.LabelFrame):
         self.uninstall_btn = ttk.Button(controls, text="Uninstall Selected", command=self.uninstall_selected)
         self.uninstall_btn.pack(side='left', padx=5)
         # Reversible counterpart to Uninstall: disables the app in place
-        # instead of deleting it, and flips to "Unfreeze" for frozen apps.
-        self.freeze_btn = ttk.Button(controls, text="Freeze", command=self.freeze_selected)
+        # instead of deleting it, and flips to "Enable" for disabled apps.
+        # The same actions are on the D/E keys and the right-click menu.
+        self.freeze_btn = ttk.Button(controls, text="Disable", command=self.freeze_selected)
         self.freeze_btn.pack(side='left', padx=5)
         self.clear_data_btn = ttk.Button(controls, text="Clear Data", command=self.clear_data_selected)
         self.clear_data_btn.pack(side='left', padx=5)
@@ -860,15 +887,28 @@ class AppManagerPanel(ttk.LabelFrame):
         list_frame.pack(side='left', fill='both', expand=True, padx=(0, 10))
         
         columns = ('name', 'state')
-        self.app_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
+        # extended: Ctrl/Shift click and drag select several apps, which the
+        # D/E keys and the context menu then act on together.
+        self.app_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
+                                     selectmode='extended')
         self.app_tree.heading('name', text='App Name')
         self.app_tree.heading('state', text='State')
         self.app_tree.column('name', width=260)
         self.app_tree.column('state', width=90, anchor='center')
-        self.app_tree.tag_configure('frozen', foreground='gray')
+        self.app_tree.tag_configure('disabled', foreground='gray')
         self.app_tree.pack(fill='both', expand=True)
         
         self.app_tree.bind('<<TreeviewSelect>>', self._on_selection_change)
+        # D disables the selection, E re-enables it: keeping an app without
+        # uninstalling it should not need a trip to the toolbar.
+        for key in ('d', 'D'):
+            self.app_tree.bind(f'<Key-{key}>', self._on_disable_key)
+        for key in ('e', 'E'):
+            self.app_tree.bind(f'<Key-{key}>', self._on_enable_key)
+        self.app_tree.bind('<Button-3>', self._on_app_context)
+        if sys.platform == 'darwin':
+            # Aqua has no Button-3; Ctrl-click reports Button-2 there.
+            self.app_tree.bind('<Button-2>', self._on_app_context)
         
         scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.app_tree.yview)
         self.app_tree.config(yscrollcommand=scrollbar.set)
@@ -883,6 +923,17 @@ class AppManagerPanel(ttk.LabelFrame):
         
         self.detail_label = ttk.Label(self, text="Select an app to see details", relief='sunken', anchor='w')
         self.detail_label.pack(fill='x', pady=(5, 0))
+        
+        # Right-click menu: the toolbar actions plus their key shortcuts,
+        # shown where people look for them.
+        self.app_menu = tk.Menu(self, tearoff=0)
+        self.app_menu.add_command(label='Disable', accelerator='D',
+                                  command=self.disable_selected)
+        self.app_menu.add_command(label='Enable', accelerator='E',
+                                  command=self.enable_selected)
+        self.app_menu.add_separator()
+        self.app_menu.add_command(label='Clear Data', command=self.clear_data_selected)
+        self.app_menu.add_command(label='Uninstall', command=self.uninstall_selected)
     
     def set_device(self, device_id):
         """Set the current device"""
@@ -937,10 +988,10 @@ class AppManagerPanel(ttk.LabelFrame):
         
         packages = [p for p in self.all_packages if search_term in p.lower()]
         for pkg in packages:
-            frozen = pkg in self.frozen_packages
+            disabled = pkg in self.frozen_packages
             self.app_tree.insert('', 'end', iid=pkg, values=(
-                pkg, '❄ Frozen' if frozen else ''),
-                tags=('frozen',) if frozen else ())
+                pkg, 'Disabled' if disabled else ''),
+                tags=('disabled',) if disabled else ())
         
         # Keep whatever is still visible selected, so a refresh, a search
         # keystroke or a freeze does not throw the selection away.
@@ -955,8 +1006,8 @@ class AppManagerPanel(ttk.LabelFrame):
         self._filter_apps()
     
     def _detail_text(self, pkg, suffix=''):
-        """Detail line for a package, including its frozen state."""
-        state = ' (frozen)' if pkg in self.frozen_packages else ''
+        """Detail line for a package, including its disabled state."""
+        state = ' (disabled)' if pkg in self.frozen_packages else ''
         return f"Package: {pkg}{state}{suffix}"
     
     def _update_freeze_button(self):
@@ -964,9 +1015,9 @@ class AppManagerPanel(ttk.LabelFrame):
         selection = self.app_tree.selection()
         packages = [self.app_tree.item(i, 'values')[0] for i in selection]
         if any(pkg in self.frozen_packages for pkg in packages):
-            self.freeze_btn.config(text='Unfreeze')
+            self.freeze_btn.config(text='Enable')
         else:
-            self.freeze_btn.config(text='Freeze')
+            self.freeze_btn.config(text='Disable')
     
     def _on_selection_change(self, event=None):
         """Handle selection change in app tree"""
@@ -1107,11 +1158,24 @@ class AppManagerPanel(ttk.LabelFrame):
         self.refresh_apps()
     
     def freeze_selected(self):
-        """Freeze or unfreeze the selected apps without touching their data.
+        """Toolbar button: move the selection to the state the label promises."""
+        self.set_disabled(self.freeze_btn.cget('text') == 'Disable')
+    
+    def disable_selected(self):
+        """Keyboard/menu: disable the selection, keeping app and data."""
+        self.set_disabled(True)
+    
+    def enable_selected(self):
+        """Keyboard/menu: re-enable the selection."""
+        self.set_disabled(False)
+    
+    def set_disabled(self, disable):
+        """Disable or enable the selected apps without touching their data.
 
-        The button states the end state every selected app moves to, so
-        repeated clicks are idempotent and no confirmation dialog is needed
-        for something that can always be undone with the same button.
+        `pm disable-user` rather than `uninstall`, so the package, its data
+        and its version survive — and the same action reverses it, which is
+        why this path asks for no confirmation (Uninstall and Clear Data
+        still do).
         """
         if not self.device_id:
             messagebox.showerror("Error", "No device selected")
@@ -1123,10 +1187,9 @@ class AppManagerPanel(ttk.LabelFrame):
             return
         
         packages = [self.app_tree.item(i, 'values')[0] for i in selected]
-        freeze = self.freeze_btn.cget('text') == 'Freeze'
         device_id = self.device_id
-        action = self.adb.freeze_package if freeze else self.adb.unfreeze_package
-        verb = 'freeze' if freeze else 'unfreeze'
+        action = self.adb.freeze_package if disable else self.adb.unfreeze_package
+        verb = 'disable' if disable else 'enable'
         
         def run():
             applied, failures = [], []
@@ -1140,9 +1203,39 @@ class AppManagerPanel(ttk.LabelFrame):
         
         self.runner.submit(
             run,
-            lambda result: self._after_freeze(result, freeze),
-            label="Freezing apps" if freeze else "Unfreezing apps",
+            lambda result: self._after_freeze(result, disable),
+            label="Disabling apps" if disable else "Enabling apps",
             widgets=[self.freeze_btn])
+    
+    def _on_state_key(self, event, action):
+        """Shared D/E handling: modifiers belong to other commands, and a
+        key press with nothing selected must not open a dialog."""
+        if event.state & (0x4 | 0x8 | 0x40):   # Ctrl, Alt, Super
+            return None
+        if self.app_tree.selection():
+            action()
+        return 'break'
+    
+    def _on_disable_key(self, event):
+        return self._on_state_key(event, self.disable_selected)
+    
+    def _on_enable_key(self, event):
+        return self._on_state_key(event, self.enable_selected)
+    
+    def _on_app_context(self, event):
+        """Right-click: select the row under the cursor, then show the menu."""
+        row = self.app_tree.identify_row(event.y)
+        if not row:
+            return                      # empty area: nothing to act on
+        if row not in self.app_tree.selection():
+            self.app_tree.selection_set(row)
+        self._post_app_menu(event.x_root, event.y_root)
+    
+    def _post_app_menu(self, x, y):
+        try:
+            self.app_menu.tk_popup(x, y)
+        finally:
+            self.app_menu.grab_release()
     
     def _after_freeze(self, result, froze):
         applied, failures = result
@@ -1280,16 +1373,25 @@ class FileManagerPanel(ttk.LabelFrame):
     def _populate(self, files, error=None):
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
+        inserted = set()
         for f in files:
             icon = '📁 ' if f['is_dir'] else '📄 '
             # The iid is the raw name: the displayed value carries an icon
             # prefix that must never be parsed back out (lstrip would eat
             # leading spaces and icon characters from real file names).
+            tags = ('dir' if f['is_dir']
+                    else 'link' if f.get('is_link') else 'file',)
+            if f['name'] in inserted:
+                # A faithful parse never yields duplicates (ls names are
+                # unique), but a Tk "item already exists" error would kill
+                # the whole callback, so drop the row instead of crashing.
+                continue
+            inserted.add(f['name'])
             self.file_tree.insert('', tk.END, iid=f['name'], values=(
                 icon + f['name'],
                 f['size'],
                 f['permissions']
-            ), tags=('dir' if f['is_dir'] else 'file',))
+            ), tags=tags)
         self.error_label.config(text=error or '')
     
     def navigate_to(self, path):
@@ -1335,7 +1437,7 @@ class FileManagerPanel(ttk.LabelFrame):
         # that must not be parsed back out.
         name = selection[0]
         tags = self.file_tree.item(selection[0], 'tags')
-        if 'dir' in tags:
+        if 'dir' in tags or 'link' in tags:
             self.navigate_to(posixpath.join(self.current_path, name))
     
     def pull_file(self):

@@ -916,8 +916,8 @@ class TestFreezeHelpers(unittest.TestCase):
         self.assertEqual(adb.list_frozen_packages('serial-1'), [])
 
 
-class TestFreezePanel(unittest.TestCase):
-    """The Freeze button is a reversible in-place action with visible state."""
+class TestDisablePanel(unittest.TestCase):
+    """Disabling is a reversible in-place action with visible state."""
 
     def setUp(self):
         import tkinter as tk
@@ -986,17 +986,17 @@ class TestFreezePanel(unittest.TestCase):
         return self._row(pkg)['values'][1]
 
     def test_frozen_apps_are_marked_in_the_list(self):
-        self.assertEqual(self._state('com.example.frozen'), '❄ Frozen')
+        self.assertEqual(self._state('com.example.frozen'), 'Disabled')
         self.assertEqual(self._state('com.example.live'), '')
-        self.assertIn('frozen', self._row('com.example.frozen')['tags'])
-        self.assertNotIn('frozen', self._row('com.example.live')['tags'])
+        self.assertIn('disabled', self._row('com.example.frozen')['tags'])
+        self.assertNotIn('disabled', self._row('com.example.live')['tags'])
 
     def test_the_button_states_the_action_for_the_selection(self):
-        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Freeze')
+        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Disable')
         self._select('com.example.live')
-        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Freeze')
+        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Disable')
         self._select('com.example.frozen')
-        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Unfreeze')
+        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Enable')
 
     def test_freezing_marks_the_app_and_keeps_the_selection(self):
         self._select('com.example.live')
@@ -1007,8 +1007,8 @@ class TestFreezePanel(unittest.TestCase):
         self.assertEqual(self.calls,
                          [('freeze', 'com.example.live', 'fake-device')])
         self.assertIn('com.example.live', self.panel.frozen_packages)
-        self.assertEqual(self._state('com.example.live'), '❄ Frozen')
-        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Unfreeze')
+        self.assertEqual(self._state('com.example.live'), 'Disabled')
+        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Enable')
         self.assertEqual(list(self.panel.app_tree.selection()),
                          ['com.example.live'])
         self.assertEqual(self.dialogs, [])
@@ -1023,7 +1023,7 @@ class TestFreezePanel(unittest.TestCase):
                          [('unfreeze', 'com.example.frozen', 'fake-device')])
         self.assertNotIn('com.example.frozen', self.panel.frozen_packages)
         self.assertEqual(self._state('com.example.frozen'), '')
-        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Freeze')
+        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Disable')
 
     def test_a_failed_freeze_is_not_recorded(self):
         self.outcome = False
@@ -1041,6 +1041,101 @@ class TestFreezePanel(unittest.TestCase):
 
         self.assertEqual(self.calls, [])
         self.assertTrue(self.dialogs)
+
+    # --- keyboard and context menu ------------------------------------
+    def _key(self, state=0, keysym='d'):
+        import types
+        return types.SimpleNamespace(state=state, keysym=keysym)
+
+    def test_the_shortcuts_are_bound_to_the_tree(self):
+        for sequence in ('<Key-d>', '<Key-D>', '<Key-e>', '<Key-E>',
+                         '<Button-3>'):
+            self.assertTrue(self.panel.app_tree.bind(sequence),
+                            f'{sequence} is not bound')
+
+    def test_d_disables_the_whole_selection(self):
+        self._select('com.example.live', 'com.example.frozen')
+
+        self.panel._on_disable_key(self._key())
+        self._pump()
+
+        self.assertEqual(self.calls,
+                         [('freeze', 'com.example.live', 'fake-device'),
+                          ('freeze', 'com.example.frozen', 'fake-device')])
+        self.assertEqual(self._state('com.example.live'), 'Disabled')
+        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Enable')
+        self.assertEqual(list(self.panel.app_tree.selection()),
+                         ['com.example.live', 'com.example.frozen'])
+
+    def test_e_enables_the_selection(self):
+        self._select('com.example.frozen')
+
+        self.panel._on_enable_key(self._key(keysym='E'))
+        self._pump()
+
+        self.assertEqual(self.calls,
+                         [('unfreeze', 'com.example.frozen', 'fake-device')])
+        self.assertEqual(self._state('com.example.frozen'), '')
+        self.assertEqual(self.panel.freeze_btn.cget('text'), 'Disable')
+
+    def test_modified_keys_belong_to_someone_else(self):
+        self._select('com.example.live')
+
+        for state in (0x4, 0x8, 0x40):        # Ctrl, Alt, Super
+            self.panel._on_disable_key(self._key(state=state))
+            self.panel._on_enable_key(self._key(state=state))
+        self._pump()
+
+        self.assertEqual(self.calls, [])
+        self.assertNotIn('com.example.live', self.panel.frozen_packages)
+
+    def test_a_key_press_with_nothing_selected_is_silent(self):
+        self.panel._on_disable_key(self._key())
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.dialogs, [])
+
+    def test_the_menu_lists_the_actions_with_their_keys(self):
+        menu = self.panel.app_menu
+        self.assertEqual(menu.entrycget(0, 'label'), 'Disable')
+        self.assertEqual(menu.entrycget(0, 'accelerator'), 'D')
+        self.assertEqual(menu.entrycget(1, 'label'), 'Enable')
+        self.assertEqual(menu.entrycget(1, 'accelerator'), 'E')
+
+    def test_the_menu_disables_the_selection_when_invoked(self):
+        self._select('com.example.live')
+
+        self.panel.app_menu.invoke(0)
+        self._pump()
+
+        self.assertEqual(self.calls,
+                         [('freeze', 'com.example.live', 'fake-device')])
+        self.assertEqual(self._state('com.example.live'), 'Disabled')
+
+    def test_right_click_takes_over_the_row_under_the_cursor(self):
+        import types
+        self.panel.app_tree.identify_row = lambda y: 'com.example.live'
+        posted = []
+        self.panel._post_app_menu = lambda x, y: posted.append((x, y))
+        self._select('com.example.frozen')
+
+        self.panel._on_app_context(
+            types.SimpleNamespace(y=10, x_root=30, y_root=40))
+
+        self.assertEqual(list(self.panel.app_tree.selection()),
+                         ['com.example.live'])
+        self.assertEqual(posted, [(30, 40)])
+
+    def test_right_click_on_empty_space_shows_no_menu(self):
+        import types
+        self.panel.app_tree.identify_row = lambda y: ''
+        posted = []
+        self.panel._post_app_menu = lambda x, y: posted.append((x, y))
+
+        self.panel._on_app_context(
+            types.SimpleNamespace(y=10, x_root=30, y_root=40))
+
+        self.assertEqual(posted, [])
 
 
 class TestFileListing(unittest.TestCase):
@@ -1068,7 +1163,17 @@ class TestFileListing(unittest.TestCase):
         # an unquoted path would be split by the device shell.
         self.assertEqual(self.calls,
                          [('-s', 'serial-1', 'shell',
-                           "ls -la '/sdcard/My Dir'")])
+                           "ls -la '/sdcard/My Dir/'")])
+
+    def test_the_listing_path_ends_with_a_slash(self):
+        """Trailing slash: `ls` then dereferences a symlinked directory
+        such as /sdcard instead of describing the link itself."""
+        adb = self._adb('total 0\n')
+
+        adb.list_files('/sdcard', 'serial-1')
+
+        self.assertEqual(self.calls,
+                         [('-s', 'serial-1', 'shell', 'ls -la /sdcard/')])
 
     def test_a_symlink_target_is_not_part_of_the_name(self):
         adb = self._adb(
@@ -1098,6 +1203,63 @@ class TestFileListing(unittest.TestCase):
         files, _ = adb.list_files('/sdcard')
 
         self.assertEqual(files[0]['name'], 'my  photo.png')
+
+    def test_padded_columns_still_parse(self):
+        """Real `ls -la` pads the size column with runs of spaces; those
+        runs are one separator, and the name keeps its own spaces."""
+        adb = self._adb(
+            'total 8\n'
+            '-rw-rw---- 1 root everybody    2 2026-09-30 22:45 '
+            'hello world.txt\n'
+            'drwxrwx--x 2 root everybody 4096 2026-09-30 22:45 sub dir\n')
+
+        files, error = adb.list_files('/sdcard')
+
+        self.assertIsNone(error)
+        self.assertEqual([f['name'] for f in files],
+                         ['hello world.txt', 'sub dir'])
+        self.assertEqual(files[0]['size'], '2')
+
+    def test_masked_fields_do_not_hide_or_corrupt_rows(self):
+        """toybox masks every field it may not stat as `?`, and the date
+        and time collapse into one column: the name follows six fields,
+        not seven, and a masked symlink prints as `name -> ?`."""
+        adb = self._adb(
+            'total 88\n'
+            'l?????????   ? ?      ?             ?                ? '
+            'cache -> ?\n'
+            'l?????????   ? ?      ?             ?                ? '
+            'init -> ?\n'
+            'd?????????   ? ?      ?             ?                ? '
+            'data_mirror\n'
+            '-?????????   ? ?      ?             ?                ? '
+            'verity_key\n'
+            'drwxr-xr-x  2 root   root       4096 2009-01-01 05:30 acct\n')
+
+        files, error = adb.list_files('/')
+
+        self.assertIsNone(error)
+        names = [f['name'] for f in files]
+        # The old parse shifted both masked symlink rows to `-> ?`: two
+        # entries, one name, and the tree insert then raised TclError.
+        self.assertEqual(names,
+                         ['cache', 'init', 'data_mirror', 'verity_key',
+                          'acct'])
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(files[0]['is_link'])
+        self.assertTrue(files[2]['is_dir'])
+        self.assertEqual(files[2]['size'], '?')
+        self.assertEqual(files[4]['size'], '4096')
+
+    def test_a_fully_masked_row_still_appears(self):
+        adb = self._adb(
+            '??????????   ? ?      ?             ?                ? '
+            'mystery\n')
+
+        files, _ = adb.list_files('/')
+
+        self.assertEqual(files[0]['name'], 'mystery')
+        self.assertEqual(files[0]['permissions'], '??????????')
 
     def test_permission_denied_is_reported_not_swallowed(self):
         adb = self._adb('ls: /data: Permission denied\n', success=False)
@@ -1259,6 +1421,26 @@ class TestFileManagerPanel(unittest.TestCase):
 
         self._show([self._entry('ok.txt')])
         self.assertEqual(self.panel.error_label.cget('text'), '')
+
+    def test_double_click_enters_a_symlink(self):
+        entry = self._entry('sdcard')
+        entry['is_link'] = True
+        self._show([entry])
+
+        self.panel.file_tree.selection_set('sdcard')
+        self.panel.on_double_click(None)
+        self._pump()
+
+        self.assertEqual(self.panel.current_path, '/sdcard/sdcard')
+
+    def test_duplicate_rows_never_crash_the_tree(self):
+        """A collapsed parse would hand the tree two rows with one iid;
+        TclError must not kill the whole populate callback."""
+        entry = self._entry('dup.txt')
+
+        self.panel._populate([entry, dict(entry)])
+
+        self.assertEqual(self.panel.file_tree.get_children(), ('dup.txt',))
 
 
 if __name__ == '__main__':
