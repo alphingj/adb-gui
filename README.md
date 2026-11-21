@@ -74,6 +74,20 @@ python3 --version
 python3 adb_gui.py
 ```
 
+## Pre-built binaries (Releases)
+
+Standalone executables are built automatically on every tagged release
+(via GitHub Actions + PyInstaller) and attached to the
+[Releases page](https://github.com/alphingj/adb-gui/releases):
+
+- **Windows**: `adb-gui-windows.exe`
+- **macOS**: `adb-gui-macOS`
+- **Linux**: `adb-gui-Linux`
+
+Download the asset for your platform from the latest release and run it —
+no Python installation required. Each executable bundles the `adb_gui.py`
+application and its dependencies.
+
 ## Usage
 
 1. **Connect your Android device** via USB

@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pytest
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -y
+            sudo apt-get install -y xvfb libtk8.6 tk8.6-dev
+          fi
+
+      - name: Run tests
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a python -m pytest tests/
+          else
+            python -m pytest tests/
+          fi
+
+      - name: Build standalone executable
+        run: |
+          pyinstaller --onefile --windowed --name adb-gui adb_gui.py
+
+      - name: Rename artifact for platform
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            mv dist/adb-gui.exe dist/adb-gui-${{ runner.os }}.exe
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            mv dist/adb-gui dist/adb-gui-${{ runner.os }}
+          else
+            mv dist/adb-gui dist/adb-gui-${{ runner.os }}
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: adb-gui-${{ runner.os }}
+          path: dist/adb-gui-${{ runner.os }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
