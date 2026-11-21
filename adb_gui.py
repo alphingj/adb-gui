@@ -8,20 +8,22 @@ from tkinter import ttk, messagebox, filedialog, scrolledtext
 import base64
 import atexit
 import io
-import queue
-import subprocess
-import threading
+import json
 import os
 import posixpath
+import queue
 import re
 import shlex
 import shutil
+import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 
 try:
     from PIL import Image
@@ -41,6 +43,54 @@ DEVICE_STATUSES = {
     'device', 'offline', 'unauthorized', 'recovery', 'sideload',
     'rescue', 'bootloader', 'host', 'no permissions', 'unknown',
 }
+
+
+class AppConfig:
+    """Tiny JSON settings store persisted under the user config dir.
+
+    Remembers window geometry, last-selected device, dark-mode preference,
+    and default push/pull directories so the app feels like a real product
+    instead of forgetting everything on restart.
+    """
+
+    DEFAULT = {
+        'window_geometry': '1200x700',
+        'dark_mode': False,
+        'last_device': '',
+        'default_pull_dir': str(Path.home()),
+        'default_push_dir': str(Path.home()),
+    }
+
+    def __init__(self):
+        self.path = Path.home() / '.config' / 'adb-gui' / 'settings.json'
+        self._data = dict(self.DEFAULT)
+        self._load()
+
+    def _load(self):
+        try:
+            if self.path.exists():
+                with self.path.open('r', encoding='utf-8') as fh:
+                    self._data.update(json.load(fh))
+        except Exception:
+            # Corrupt or unreadable config is not fatal; start fresh.
+            self._data = dict(self.DEFAULT)
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open('w', encoding='utf-8') as fh:
+                json.dump(self._data, fh, indent=2)
+        except Exception:
+            pass  # Best effort; config failure must never crash the app.
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key, value):
+        self._data[key] = value
+
+
+CONFIG = AppConfig()
 
 
 def parse_device_list(output):
@@ -486,7 +536,39 @@ class ADBWrapper:
         """Push a file to device"""
         prefix = ['-s', device_id] if device_id else []
         return self.run_command(*prefix, 'push', local_path, remote_path, timeout=300)
-    
+
+    def mkdir(self, path, device_id=None):
+        """Create a directory on the device: `mkdir -p <path>`."""
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'mkdir', '-p', path)
+
+    def delete(self, path, device_id=None, recursive=False):
+        """Delete a file or directory on the device.
+
+        Uses `rm -r` for directories so non-empty folders can be removed.
+        """
+        prefix = ['-s', device_id] if device_id else []
+        cmd = ['shell', 'rm']
+        if recursive:
+            cmd.append('-r')
+        cmd.append(shlex.quote(path))
+        return self.run_command(*prefix, *cmd)
+
+    def rename(self, src, dst, device_id=None):
+        """Rename / move a file or directory on the device: `mv <src> <dst>`."""
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'mv',
+                                shlex.quote(src), shlex.quote(dst))
+
+    def find_files(self, path, pattern, device_id=None):
+        """Find files on the device: `find <path> -name <pattern>`.
+
+        Returns (output, success). output is the raw find result.
+        """
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(
+            *prefix, 'shell', 'find', path, '-name', shlex.quote(pattern))
+
     def take_screenshot(self, save_path, device_id=None):
         """Take a screenshot"""
         prefix = ['-s', device_id] if device_id else []
@@ -555,7 +637,73 @@ class ADBWrapper:
         """Get app information"""
         prefix = ['-s', device_id] if device_id else []
         return self.run_command(*prefix, 'shell', 'dumpsys', 'package', package_name)
-    
+
+    def get_exported_activities(self, package_name, device_id=None):
+        """List exported (launchable) activities for a package.
+
+        Parses `pm dump <pkg>` and returns activity names that carry
+        `android:exported="true"` and an intent filter with MAIN/LAUNCHER,
+        plus any other exported activities the package declares.
+        """
+        prefix = ['-s', device_id] if device_id else []
+        out, ok = self.run_command(*prefix, 'shell', 'pm', 'dump', package_name)
+        if not ok:
+            return [], out
+        activities = []
+        current = None
+        exported = False
+        has_main_launcher = False
+        for line in out.splitlines():
+            stripped = line.strip()
+            # Activity declarations look like "  Activity x: .FooActivity"
+            m = re.match(r'Activity\s+\S+:\s+(\S+)', stripped)
+            if m:
+                if current and (exported or has_main_launcher):
+                    activities.append(current)
+                current = m.group(1)
+                exported = False
+                has_main_launcher = False
+                continue
+            if current is None:
+                continue
+            low = stripped.lower()
+            if 'exported="true"' in low or "exported='true'" in low:
+                exported = True
+            if 'action android:name="android.intent.action.MAIN"' in low:
+                has_main_launcher = True
+            if 'category android:name="android.intent.category.LAUNCHER"' in low:
+                has_main_launcher = True
+        if current and (exported or has_main_launcher):
+            activities.append(current)
+        return activities, ""
+
+    def launch_activity(self, package_name, activity, device_id=None):
+        """Launch a specific activity: `am start -n <pkg>/<activity>`."""
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'am', 'start',
+                                '-n', f'{package_name}/{activity}')
+
+    def send_intent(self, action, data, package, device_id=None):
+        """Send an intent: `am start -a <action> -d <data> <pkg>`."""
+        prefix = ['-s', device_id] if device_id else []
+        cmd = ['shell', 'am', 'start', '-a', action]
+        if data:
+            cmd += ['-d', data]
+        if package:
+            cmd += [package]
+        return self.run_command(*prefix, *cmd)
+
+    def send_broadcast(self, action, device_id=None):
+        """Send a broadcast: `am broadcast -a <action>`."""
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'am', 'broadcast', '-a', action)
+
+    def get_app_ops(self, package_name, device_id=None):
+        """Get runtime permission/op state for a package."""
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'dumpsys', 'appops',
+                                package_name)
+
     def force_stop_app(self, package_name, device_id=None):
         """Force stop an app"""
         prefix = ['-s', device_id] if device_id else []
@@ -575,7 +723,77 @@ class ADBWrapper:
         """Reverse port from device to host"""
         prefix = ['-s', device_id] if device_id else []
         return self.run_command(*prefix, 'reverse', f'tcp:{device_port}', f'tcp:{host_port}')
-    
+
+    def set_stay_on(self, device_id=None, enabled=True):
+        """Keep the screen on while charging (or restore normal sleep)."""
+        value = 'true' if enabled else 'false'
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'svc', 'power', 'stayon', value)
+
+    def set_wifi(self, device_id=None, enabled=True):
+        """Turn Wi-Fi on or off."""
+        value = 'enable' if enabled else 'disable'
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'svc', 'wifi', value)
+
+    def set_bluetooth(self, device_id=None, enabled=True):
+        """Turn Bluetooth on or off."""
+        value = 'enable' if enabled else 'disable'
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'svc', 'bluetooth', value)
+
+    def set_dnd(self, device_id=None, enabled=True):
+        """Toggle Do Not Disturb (Zen mode 0=off, 1=no interruptions)."""
+        value = '1' if enabled else '0'
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'shell', 'settings', 'put',
+                                'secure', 'zen_mode', value)
+
+    def set_ui_mode(self, device_id=None, mode='normal'):
+        """Set UI mode: normal, night, car, or desk."""
+        prefix = ['-s', device_id] if device_id else []
+        return self.run_command(*prefix, 'cmd', 'uimode', mode)
+
+    def extract_apk(self, package_name, local_path, device_id=None):
+        """Pull an installed APK from the device to a local file.
+
+        Resolves the package's install path via `pm path`, then pulls it.
+        """
+        prefix = ['-s', device_id] if device_id else []
+
+        def run():
+            out, ok = self.run_command(*prefix, 'shell', 'pm', 'path',
+                                       package_name)
+            if not ok:
+                return out, False
+            # pm path prints "package:/data/app/.../base.apk"
+            remote = None
+            for line in out.splitlines():
+                if line.startswith('package:'):
+                    remote = line.split(':', 1)[1].strip()
+                    break
+            if not remote:
+                return f"Could not resolve path for {package_name}", False
+            return self.pull_file(remote, local_path, device_id)
+
+        return run()
+
+    def run_on_all_devices(self, command, *args):
+        """Run one adb shell command on every connected device.
+
+        Returns a dict of {serial: (output, success)}.
+        """
+        devices = self.get_devices()
+        results = {}
+        for dev in devices:
+            serial = dev.get('serial') or dev.get('id')
+            if not serial:
+                continue
+            out, ok = self.run_command('-s', serial, 'shell', command,
+                                       *args)
+            results[serial] = (out, ok)
+        return results
+
     def get_app_icon(self, package_name, device_id=None):
         """Get an app icon as PNG bytes
 
@@ -933,6 +1151,10 @@ class AppManagerPanel(ttk.LabelFrame):
                                   command=self.enable_selected)
         self.app_menu.add_separator()
         self.app_menu.add_command(label='Clear Data', command=self.clear_data_selected)
+        self.app_menu.add_command(label='Clear Cache', command=self.clear_cache_selected)
+        self.app_menu.add_command(label='Force Stop', command=self.force_stop_selected)
+        self.app_menu.add_separator()
+        self.app_menu.add_command(label='App Info', command=self.app_info_selected)
         self.app_menu.add_command(label='Uninstall', command=self.uninstall_selected)
     
     def set_device(self, device_id):
@@ -1282,6 +1504,87 @@ class AppManagerPanel(ttk.LabelFrame):
         else:
             messagebox.showinfo("Success", "Data cleared")
 
+    # ---- newly exposed dormant wrapper actions ---------------------------
+
+    def clear_cache_selected(self):
+        """Clear the cache of the selected apps."""
+        self._clear_action_selected(
+            'clear_app_cache', 'Clear Cache', 'clearing cache for',
+            'Cache cleared', 'Failed to clear cache for {}')
+
+    def force_stop_selected(self):
+        """Force stop the selected apps."""
+        self._clear_action_selected(
+            'force_stop_app', 'Force Stop', 'force stopping',
+            'Apps stopped', 'Failed to force stop {}')
+
+    def app_info_selected(self):
+        """Show package details for the selected app."""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        selected = self.app_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "No app selected")
+            return
+        pkg = self.app_tree.item(selected[0], 'values')[0]
+        device_id = self.device_id
+
+        def run():
+            return self.adb.get_app_info(pkg, device_id)
+
+        def show(result):
+            output, success = result
+            if success:
+                self._show_app_info(pkg, output)
+            else:
+                messagebox.showerror("Error", f"Could not read app info:\n{output}")
+
+        self.runner.submit(run, show, label=f"Reading info for {pkg}")
+
+    def _clear_action_selected(self, method, label, verb, success_msg, fail_msg):
+        """Shared runner for per-app actions that take one package each."""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        selected = self.app_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "No app selected")
+            return
+        packages = [self.app_tree.item(i, 'values')[0] for i in selected]
+        device_id = self.device_id
+        action = getattr(self.adb, method)
+
+        def run():
+            failures = []
+            for pkg in packages:
+                output, success = action(pkg, device_id)
+                if not success:
+                    failures.append(fail_msg.format(pkg) + f":\n{output}")
+            return failures
+
+        def done(failures):
+            if failures:
+                messagebox.showerror("Error", "\n\n".join(failures))
+            else:
+                messagebox.showinfo("Success", f"{success_msg} ({len(packages)} app(s))")
+                self.refresh_apps()
+
+        self.runner.submit(run, done, label=f"{verb} {len(packages)} app(s)")
+
+    def _show_app_info(self, pkg, info_text):
+        """Display package details in a read-only dialog."""
+        dlg = tk.Toplevel(self)
+        dlg.title(f"App Info — {pkg}")
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        txt = scrolledtext.ScrolledText(dlg, width=70, height=25)
+        txt.pack(fill='both', expand=True, padx=10, pady=10)
+        txt.insert('1.0', info_text)
+        txt.config(state='disabled')
+        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(pady=(0, 10))
+
+
 
 class FileManagerPanel(ttk.LabelFrame):
     """Panel for file management"""
@@ -1335,6 +1638,13 @@ class FileManagerPanel(ttk.LabelFrame):
         
         self.refresh_btn = ttk.Button(btn_frame, text="Refresh", command=self.refresh_files)
         self.refresh_btn.pack(side='left', padx=2)
+        self.mkdir_btn = ttk.Button(btn_frame, text="New Folder", command=self.mkdir_dialog)
+        self.mkdir_btn.pack(side='left', padx=2)
+        self.rename_btn = ttk.Button(btn_frame, text="Rename", command=self.rename_dialog)
+        self.rename_btn.pack(side='left', padx=2)
+        self.delete_btn = ttk.Button(btn_frame, text="Delete", command=self.delete_dialog)
+        self.delete_btn.pack(side='left', padx=2)
+        ttk.Button(btn_frame, text="Search", command=self.search_dialog).pack(side='left', padx=2)
         self.pull_btn = ttk.Button(btn_frame, text="Pull File", command=self.pull_file)
         self.pull_btn.pack(side='left', padx=2)
         self.push_btn = ttk.Button(btn_frame, text="Push File", command=self.push_file)
@@ -1505,6 +1815,171 @@ class FileManagerPanel(ttk.LabelFrame):
             self.refresh_files()
         else:
             messagebox.showerror("Error", f"Push failed:\n{output}")
+
+    # ---- new file operations: mkdir, rename, delete, find --------------
+
+    def mkdir_dialog(self):
+        """Prompt for a new folder name and create it on the device."""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        name = self._prompt("New folder name", "Enter folder name:")
+        if not name:
+            return
+        remote_path = posixpath.join(self.current_path, name)
+        device_id = self.device_id
+
+        def run():
+            return self.adb.mkdir(remote_path, device_id)
+
+        def done(result):
+            output, success = result
+            if success:
+                self.refresh_files()
+            else:
+                messagebox.showerror("Error", f"Could not create folder:\n{output}")
+
+        self.runner.submit(run, done, label="Creating folder")
+
+    def rename_dialog(self):
+        """Prompt for a new name and rename the selected item."""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        selection = self.file_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "No item selected")
+            return
+        old_name = selection[0]
+        old_path = posixpath.join(self.current_path, old_name)
+        new_name = self._prompt("Rename", f"New name for '{old_name}':", initial=old_name)
+        if not new_name or new_name == old_name:
+            return
+        new_path = posixpath.join(self.current_path, new_name)
+        device_id = self.device_id
+
+        def run():
+            return self.adb.rename(old_path, new_path, device_id)
+
+        def done(result):
+            output, success = result
+            if success:
+                self.refresh_files()
+            else:
+                messagebox.showerror("Error", f"Rename failed:\n{output}")
+
+        self.runner.submit(run, done, label="Renaming item")
+
+    def delete_dialog(self):
+        """Prompt for confirmation and delete the selected item(s)."""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        selection = self.file_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "No item selected")
+            return
+        items = list(selection)
+        tags = [self.file_tree.item(i, 'tags') for i in items]
+        any_dir = any('dir' in t for t in tags)
+        count = len(items)
+        if not messagebox.askyesno(
+                "Confirm delete",
+                f"Delete {count} item(s)?\n" + "\n".join(items) +
+                (("\nThis includes folders and their contents.") if any_dir else "")):
+            return
+        device_id = self.device_id
+
+        def run():
+            failures = []
+            for name in items:
+                remote_path = posixpath.join(self.current_path, name)
+                is_dir = 'dir' in self.file_tree.item(name, 'tags')
+                output, success = self.adb.delete(remote_path, device_id, recursive=is_dir)
+                if not success:
+                    failures.append(f"{name}:\n{output}")
+            return failures
+
+        def done(failures):
+            if failures:
+                messagebox.showerror("Error", "\n\n".join(failures))
+            self.refresh_files()
+
+        self.runner.submit(run, done, label=f"Deleting {count} item(s)")
+
+    def search_dialog(self):
+        """Prompt for a filename pattern and search the current directory."""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        pattern = self._prompt("Search", "Filename pattern (e.g. *.log):", initial='*')
+        if not pattern:
+            return
+        device_id = self.device_id
+        path = self.current_path
+
+        def run():
+            return self.adb.find_files(path, pattern, device_id)
+
+        def done(result):
+            output, success = result
+            self._populate_search_results(pattern, output, success)
+
+        self.runner.submit(run, done, label="Searching files")
+
+    def _populate_search_results(self, pattern, output, success):
+        """Show find results in the tree (read-only search view)."""
+        for item in self.file_tree.get_children():
+            self.file_tree.delete(item)
+        if not success:
+            self.error_label.config(text=f"Search error: {output}")
+            return
+        self.error_label.config(text=f"Results for '{pattern}' in {self.current_path}:")
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # show just the name portion
+            name = posixpath.basename(line)
+            is_dir = False  # find output doesn't tell us type easily here
+            self.file_tree.insert('', tk.END, iid=name, values=(
+                '📄 ' + name, '', ''
+            ))
+        # Refresh button still works to go back to normal listing
+
+    def _prompt(self, title, prompt, initial=''):
+        """Show a simple text input dialog and return the entered string."""
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        result = {}
+
+        ttk.Label(dlg, text=prompt).pack(padx=20, pady=(15, 5))
+        var = tk.StringVar(value=initial)
+        entry = ttk.Entry(dlg, textvariable=var, width=40)
+        entry.pack(padx=20, pady=5)
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(pady=(10, 15))
+
+        def ok():
+            result['value'] = var.get()
+            dlg.destroy()
+
+        def cancel():
+            result['value'] = None
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="OK", command=ok).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=cancel).pack(side='left', padx=5)
+        entry.bind('<Return>', lambda e: ok())
+        entry.bind('<Escape>', lambda e: cancel())
+        dlg.wait_window()
+        return result.get('value')
 
 
 class ShellPanel(ttk.LabelFrame):
@@ -1890,6 +2365,1658 @@ class LogcatPanel(ttk.LabelFrame):
         self.log_text.config(state='disabled')
 
 
+class PortForwardPanel(ttk.LabelFrame):
+    """TCP port forwarding between host and device.
+
+    Uses `adb forward` (host -> device) and `adb reverse` (device -> host),
+    which work on every non-rooted device. Handy for accessing a dev server
+    running on the phone from the PC browser, or exposing a PC port to the
+    device.
+    """
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Port Forwarding", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+
+        # Inputs
+        controls = ttk.Frame(self)
+        controls.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(controls, text="Host port:").pack(side='left')
+        self.host_port_var = tk.StringVar(value='8080')
+        ttk.Entry(controls, textvariable=self.host_port_var, width=8).pack(side='left', padx=(2, 8))
+
+        ttk.Label(controls, text="Device port:").pack(side='left')
+        self.device_port_var = tk.StringVar(value='8080')
+        ttk.Entry(controls, textvariable=self.device_port_var, width=8).pack(side='left', padx=(2, 8))
+
+        ttk.Button(controls, text="Forward (host→device)",
+                   command=self.forward).pack(side='left', padx=(8, 2))
+        ttk.Button(controls, text="Reverse (device→host)",
+                   command=self.reverse).pack(side='left')
+        ttk.Button(controls, text="List active",
+                   command=self.list_forwards).pack(side='left', padx=(8, 0))
+        ttk.Button(controls, text="Clear all",
+                   command=self.clear_all).pack(side='left', padx=(2, 0))
+
+        self.listbox = tk.Listbox(self, height=8)
+        self.listbox.pack(fill='both', expand=True)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Button, ttk.Entry)):
+                        w.config(state=state)
+        self.listbox.config(state=state)
+        if device_id:
+            self.list_forwards()
+
+    def _ports(self):
+        try:
+            return int(self.host_port_var.get()), int(self.device_port_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Ports must be numbers")
+            return None
+
+    def forward(self):
+        """adb forward tcp:host tcp:device"""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        ports = self._ports()
+        if not ports:
+            return
+        host_port, device_port = ports
+
+        def run():
+            return self.adb.forward_port(host_port, device_port, self.device_id)
+
+        def done(result):
+            output, success = result
+            if success:
+                messagebox.showinfo("Forwarded",
+                                    f"Host:{host_port} → Device:{device_port}")
+                self.list_forwards()
+            else:
+                messagebox.showerror("Error", f"Forward failed:\n{output}")
+
+        self.runner.submit(run, done, label="Forwarding port")
+
+    def reverse(self):
+        """adb reverse tcp:device tcp:host"""
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        ports = self._ports()
+        if not ports:
+            return
+        host_port, device_port = ports
+
+        def run():
+            return self.adb.reverse_port(device_port, host_port, self.device_id)
+
+        def done(result):
+            output, success = result
+            if success:
+                messagebox.showinfo("Reversed",
+                                    f"Device:{device_port} → Host:{host_port}")
+                self.list_forwards()
+            else:
+                messagebox.showerror("Error", f"Reverse failed:\n{output}")
+
+        self.runner.submit(run, done, label="Reversing port")
+
+    def list_forwards(self):
+        if not self.device_id:
+            return
+
+        def run():
+            return self.adb.run_command('-s', self.device_id, 'forward', '--list')
+
+        def done(result):
+            output, success = result
+            self.listbox.delete(0, tk.END)
+            if success:
+                for line in output.splitlines():
+                    if line.strip():
+                        self.listbox.insert(tk.END, line)
+            else:
+                self.listbox.insert(tk.END, f"(error: {output})")
+
+        self.runner.submit(run, done, label="Listing forwards")
+
+    def clear_all(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        if not messagebox.askyesno("Confirm", "Remove all port forwards?"):
+            return
+
+        def run():
+            return self.adb.run_command('-s', self.device_id, 'forward', '--remove-all')
+
+        def done(result):
+            output, success = result
+            if success:
+                self.list_forwards()
+            else:
+                messagebox.showerror("Error", f"Clear failed:\n{output}")
+
+        self.runner.submit(run, done, label="Clearing forwards")
+
+
+class HardwareMonitorPanel(ttk.LabelFrame):
+    """Read-only hardware stats: CPU, battery, GPU frames, thermals.
+
+    Works on non-rooted devices — nothing here requires elevated privileges.
+    Refreshes on demand; auto-refresh can be toggled.
+    """
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Hardware Monitor", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+        self._auto_job = None
+        self._auto = False
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        self.refresh_btn = ttk.Button(top, text="Refresh", command=self.refresh)
+        self.refresh_btn.pack(side='left')
+
+        self.auto_var = tk.BooleanVar(value=False)
+        self.auto_chk = ttk.Checkbutton(top, text="Auto-refresh (2s)",
+                                        variable=self.auto_var,
+                                        command=self._toggle_auto)
+        self.auto_chk.pack(side='left', padx=(10, 0))
+
+        self.root_var = tk.BooleanVar(value=False)
+        self.root_chk = ttk.Checkbutton(top, text="Root required for freq",
+                                        variable=self.root_var, state='disabled')
+        self.root_chk.pack(side='left', padx=(10, 0))
+
+        self.text = scrolledtext.ScrolledText(self, height=16, wrap=tk.WORD)
+        self.text.pack(fill='both', expand=True)
+        self.text.config(state='disabled')
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        self.refresh_btn.config(state=state)
+        self.auto_chk.config(state=state)
+        if not device_id:
+            self._toggle_auto(False)
+            self.auto_var.set(False)
+
+    def _toggle_auto(self, *_):
+        self._auto = bool(self.auto_var.get())
+        if self._auto_job:
+            self.after_cancel(self._auto_job)
+            self._auto_job = None
+        if self._auto and self.device_id:
+            self._schedule_auto()
+
+    def _schedule_auto(self):
+        self._auto_job = self.after(2000, self._auto_tick)
+
+    def _auto_tick(self):
+        if self._auto and self.device_id and not self._closing():
+            self.refresh()
+            self._schedule_auto()
+
+    def _closing(self):
+        return getattr(self.winfo_toplevel(), '_closing', False)
+
+    def refresh(self):
+        if not self.device_id:
+            return
+
+        def run():
+            parts = []
+            # CPU load
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell', 'dumpsys', 'cpuinfo')
+            parts.append("=== CPU ===")
+            parts.append(out if ok else f"(error: {out})")
+            # Battery
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell', 'dumpsys', 'battery')
+            parts.append("\n=== BATTERY ===")
+            parts.append(out if ok else f"(error: {out})")
+            # GPU surfaceflinger (frame stats)
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell', 'dumpsys', 'SurfaceFlinger', '--latency', '5')
+            parts.append("\n=== GPU (last 5 frames latency ms) ===")
+            parts.append(out if ok else f"(error: {out})")
+            # Thermals (best effort)
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell', 'dumpsys', 'thermalservice')
+            parts.append("\n=== THERMAL ===")
+            parts.append(out if ok else f"(error: {out})")
+            return "\n".join(parts)
+
+        def done(text):
+            self.text.config(state='normal')
+            self.text.delete('1.0', tk.END)
+            self.text.insert('1.0', text)
+            self.text.config(state='disabled')
+            self.text.see('1.0')
+
+        self.runner.submit(run, done, label="Reading hardware stats")
+
+
+class RemoteControlPanel(ttk.LabelFrame):
+    """Device-wide toggles that need no root: Stay Awake, Wi-Fi, Bluetooth."""
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Device Controls", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+
+        self.stay_var = tk.BooleanVar(value=False)
+        self.wifi_var = tk.BooleanVar(value=False)
+        self.bt_var = tk.BooleanVar(value=False)
+        self.dnd_var = tk.BooleanVar(value=False)
+        self.ui_mode_var = tk.StringVar(value='normal')
+
+        row = ttk.Frame(self)
+        row.pack(fill='x', pady=(0, 5))
+
+        self.stay_btn = ttk.Checkbutton(row, text="Stay Awake (screen on)",
+                                        variable=self.stay_var,
+                                        command=self._toggle_stay)
+        self.stay_btn.pack(side='left', padx=(0, 12))
+
+        self.wifi_btn = ttk.Checkbutton(row, text="Wi-Fi",
+                                        variable=self.wifi_var,
+                                        command=self._toggle_wifi)
+        self.wifi_btn.pack(side='left', padx=(0, 12))
+
+        self.bt_btn = ttk.Checkbutton(row, text="Bluetooth",
+                                      variable=self.bt_var,
+                                      command=self._toggle_bt)
+        self.bt_btn.pack(side='left', padx=(0, 12))
+
+        self.dnd_btn = ttk.Checkbutton(row, text="Do Not Disturb",
+                                       variable=self.dnd_var,
+                                       command=self._toggle_dnd)
+        self.dnd_btn.pack(side='left', padx=(0, 12))
+
+        ttk.Label(row, text="UI mode:").pack(side='left')
+        self.ui_mode_combo = ttk.Combobox(row, textvariable=self.ui_mode_var,
+                                          values=('normal', 'night', 'car',
+                                                  'desk'),
+                                          width=10, state='readonly')
+        self.ui_mode_combo.pack(side='left', padx=(2, 0))
+        self.ui_mode_combo.bind('<<ComboboxSelected>>',
+                                lambda _e: self._toggle_ui_mode())
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        for w in (self.stay_btn, self.wifi_btn, self.bt_btn,
+                  self.dnd_btn, self.ui_mode_combo):
+            w.config(state=state)
+        if device_id:
+            self._sync_states()
+
+    def _sync_states(self):
+        # Read current state from the device so the checks reflect reality.
+        def run():
+            results = {}
+            for name, cmd in (('stay', ['svc', 'power', 'stayon']),
+                              ('wifi', ['svc', 'wifi']),
+                              ('bt', ['svc', 'bluetooth']),
+                              ('dnd', ['settings', 'get', 'secure',
+                                       'zen_mode']),
+                              ('uimode', ['cmd', 'uimode'])):
+                out, ok = self.adb.run_command('-s', self.device_id, 'shell',
+                                               *cmd)
+                results[name] = (out, ok)
+            return results
+
+        def done(results):
+            # stayon: "stayon true" / "stayon false"
+            out, ok = results.get('stay', ('', False))
+            self.stay_var.set(ok and 'true' in out.lower())
+            # wifi: "wifi enabled" / "wifi disabled"
+            out, ok = results.get('wifi', ('', False))
+            self.wifi_var.set(ok and 'enabled' in out.lower())
+            # bt: "bluetooth enabled" / "bluetooth disabled"
+            out, ok = results.get('bt', ('', False))
+            self.bt_var.set(ok and 'enabled' in out.lower())
+            # dnd: zen_mode value "0" or "1"
+            out, ok = results.get('dnd', ('', False))
+            self.dnd_var.set(ok and out.strip() == '1')
+            # uimode: parse "System UI mode: normal" / "night"
+            out, ok = results.get('uimode', ('', False))
+            mode = 'normal'
+            if ok:
+                for line in out.splitlines():
+                    if 'night' in line.lower():
+                        mode = 'night'
+                        break
+                    if 'car' in line.lower():
+                        mode = 'car'
+                        break
+                    if 'desk' in line.lower():
+                        mode = 'desk'
+                        break
+            self.ui_mode_var.set(mode)
+
+        self.runner.submit(run, done, label="Syncing device state")
+
+    def _toggle_stay(self):
+        self._toggle('stay', self.stay_var.get(), self.adb.set_stay_on)
+
+    def _toggle_wifi(self):
+        self._toggle('wifi', self.wifi_var.get(), self.adb.set_wifi)
+
+    def _toggle_bt(self):
+        self._toggle('bt', self.bt_var.get(), self.adb.set_bluetooth)
+
+    def _toggle_dnd(self):
+        self._toggle('dnd', self.dnd_var.get(), self.adb.set_dnd)
+
+    def _toggle_ui_mode(self):
+        if not self.device_id:
+            return
+        mode = self.ui_mode_var.get()
+
+        def run():
+            return self.adb.set_ui_mode(self.device_id, mode)
+
+        def done(result):
+            output, success = result
+            if not success:
+                messagebox.showerror("Error", f"UI mode failed:\n{output}")
+
+        self.runner.submit(run, done, label="Setting UI mode")
+
+    def _toggle(self, name, enabled, fn):
+        if not self.device_id:
+            return
+
+        def run():
+            return fn(self.device_id, enabled)
+
+        def done(result):
+            output, success = result
+            if not success:
+                # Revert the checkmark on failure
+                if name == 'stay':
+                    self.stay_var.set(not enabled)
+                elif name == 'wifi':
+                    self.wifi_var.set(not enabled)
+                elif name == 'bt':
+                    self.bt_var.set(not enabled)
+                elif name == 'dnd':
+                    self.dnd_var.set(not enabled)
+                messagebox.showerror("Error", f"{name} toggle failed:\n{output}")
+
+        self.runner.submit(run, done, label=f"Toggling {name}")
+
+
+class ApkExtractorPanel(ttk.LabelFrame):
+    """Extract installed APKs from the device to the PC.
+
+    Resolves the install path via `pm path`, then pulls the file.
+    Works on non-rooted devices for user-installed apps.
+    """
+
+    def __init__(self, parent, adb, runner, app=None):
+        super().__init__(parent, text="APK Extractor", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.app = app
+        self.device_id = None
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(top, text="Package:").pack(side='left')
+        self.pkg_var = tk.StringVar()
+        self.pkg_entry = ttk.Entry(top, textvariable=self.pkg_var, width=30)
+        self.pkg_entry.pack(side='left', padx=(2, 8))
+        ttk.Button(top, text="Browse apps",
+                   command=self._fill_from_selection).pack(side='left',
+                                                           padx=(2, 8))
+        ttk.Button(top, text="Extract APK",
+                   command=self.extract).pack(side='left')
+
+        self.listbox = tk.Listbox(self, height=8)
+        self.listbox.pack(fill='both', expand=True, pady=(5, 0))
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        self.pkg_entry.config(state=state)
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Button, ttk.Entry)):
+                        w.config(state=state)
+        self.listbox.config(state=state)
+        if device_id:
+            self._refresh_list()
+
+    def _fill_from_selection(self):
+        """Copy the currently selected app package from the Apps tab."""
+        # Best effort: look for an AppManagerPanel ancestor.
+        apps = self._find_app_panel()
+        if apps:
+            sel = apps.app_tree.selection()
+            if sel:
+                pkg = apps.app_tree.item(sel[0], 'values')[0]
+                self.pkg_var.set(pkg)
+
+    def _find_app_panel(self):
+        if self.app and hasattr(self.app, 'apps_panel'):
+            return self.app.apps_panel
+        parent = self.master
+        while parent:
+            if isinstance(parent, AppManagerPanel):
+                return parent
+            parent = parent.master
+        return None
+
+    def _refresh_list(self):
+        if not self.device_id:
+            return
+
+        def run():
+            return self.adb.list_packages(self.device_id,
+                                          third_party_only=True)
+
+        def done(result):
+            output, success = result
+            self.listbox.delete(0, tk.END)
+            if success:
+                for line in output.splitlines():
+                    pkg = line.replace('package:', '').strip()
+                    if pkg:
+                        self.listbox.insert(tk.END, pkg)
+
+        self.runner.submit(run, done, label="Listing packages")
+
+    def extract(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        pkg = self.pkg_var.get().strip()
+        if not pkg:
+            messagebox.showwarning("Warning", "Enter a package name")
+            return
+
+        default_name = f"{pkg}.apk"
+        local_path = filedialog.asksaveasfilename(
+            defaultextension='.apk',
+            initialfile=default_name,
+            title=f"Save {pkg} APK as",
+            filetypes=[("APK files", "*.apk"), ("All files", "*.*")])
+        if not local_path:
+            return
+
+        def run():
+            return self.adb.extract_apk(pkg, local_path, self.device_id)
+
+        def done(result):
+            output, success = result
+            if success:
+                messagebox.showinfo("Extracted",
+                                    f"APK saved to:\n{local_path}")
+            else:
+                messagebox.showerror("Error", f"Extraction failed:\n{output}")
+
+        self.runner.submit(run, done, label=f"Extracting {pkg}")
+
+
+class MultiDevicePanel(ttk.LabelFrame):
+    """Send one shell command to every connected device at once.
+
+    Useful for fleet QA: install the same APK on 5 devices, reboot all,
+    or run a diagnostic command everywhere.
+    """
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Multi-Device", padding=10)
+        self.adb = adb
+        self.runner = runner
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(top, text="Command:").pack(side='left')
+        self.cmd_var = tk.StringVar()
+        self.cmd_entry = ttk.Entry(top, textvariable=self.cmd_var, width=40)
+        self.cmd_entry.pack(side='left', padx=(2, 8), fill='x', expand=True)
+        ttk.Button(top, text="Run on all devices",
+                   command=self.run_all).pack(side='left')
+
+        self.tree = ttk.Treeview(self, columns=('serial', 'output'),
+                                 show='headings', height=8)
+        self.tree.heading('serial', text='Device')
+        self.tree.heading('output', text='Result')
+        self.tree.column('serial', width=120)
+        self.tree.column('output', width=400)
+        self.tree.pack(fill='both', expand=True)
+
+        scroll = ttk.Scrollbar(self, orient='vertical',
+                               command=self.tree.yview)
+        self.tree.configure(yscroll=scroll.set)
+        scroll.pack(side='right', fill='y')
+
+    def run_all(self):
+        cmd = self.cmd_var.get().strip()
+        if not cmd:
+            messagebox.showwarning("Warning", "Enter a command")
+            return
+
+        # Split into tokens, but keep it simple: shell command + args.
+        parts = shlex.split(cmd)
+        shell_cmd = parts[0]
+        shell_args = parts[1:]
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        def run():
+            return self.adb.run_on_all_devices(shell_cmd, *shell_args)
+
+        def done(results):
+            for serial, (output, ok) in results.items():
+                status = 'OK' if ok else 'FAIL'
+                snippet = output.strip().replace('\n', ' | ')[:200]
+                display = f"[{status}] {snippet}"
+                self.tree.insert('', tk.END, values=(serial, display))
+
+        self.runner.submit(run, done, label=f"Running on {len(results) if results else 0} devices")
+
+
+class ActivityLauncherPanel(ttk.LabelFrame):
+    """Launch exported activities of a selected app.
+
+    Parses `pm dump <pkg>` to find activities with
+    `android:exported="true"` or MAIN/LAUNCHER intent filters, then lets the
+    user launch any one with `am start -n`. No root required.
+    """
+
+    def __init__(self, parent, adb, runner, app=None):
+        super().__init__(parent, text="Activity Launcher", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.app = app
+        self.device_id = None
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(top, text="Package:").pack(side='left')
+        self.pkg_var = tk.StringVar()
+        self.pkg_entry = ttk.Entry(top, textvariable=self.pkg_var, width=30)
+        self.pkg_entry.pack(side='left', padx=(2, 8))
+        ttk.Button(top, text="Scan activities",
+                   command=self.scan).pack(side='left')
+        ttk.Button(top, text="Launch selected",
+                   command=self.launch).pack(side='left', padx=(8, 0))
+
+        self.listbox = tk.Listbox(self, height=10)
+        self.listbox.pack(fill='both', expand=True, pady=(5, 0))
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        self.pkg_entry.config(state=state)
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Button, ttk.Entry)):
+                        w.config(state=state)
+        self.listbox.config(state=state)
+
+    def _fill_from_app_panel(self):
+        """Copy the currently selected app package from the Apps tab."""
+        apps = self._find_app_panel()
+        if apps:
+            sel = apps.app_tree.selection()
+            if sel:
+                pkg = apps.app_tree.item(sel[0], 'values')[0]
+                self.pkg_var.set(pkg)
+                return True
+        return False
+
+    def _find_app_panel(self):
+        if self.app and hasattr(self.app, 'apps_panel'):
+            return self.app.apps_panel
+        parent = self.master
+        while parent:
+            if isinstance(parent, AppManagerPanel):
+                return parent
+            parent = parent.master
+        return None
+
+    def scan(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        pkg = self.pkg_var.get().strip()
+        if not pkg:
+            if not self._fill_from_app_panel():
+                messagebox.showwarning("Warning", "Enter a package name")
+            else:
+                pkg = self.pkg_var.get().strip()
+        if not pkg:
+            return
+
+        def run():
+            return self.adb.get_exported_activities(pkg, self.device_id)
+
+        def done(result):
+            activities, error = result
+            self.listbox.delete(0, tk.END)
+            if not activities:
+                if error:
+                    self.listbox.insert(tk.END, f"(error: {error})")
+                else:
+                    self.listbox.insert(tk.END, "(no exported activities found)")
+            else:
+                for act in activities:
+                    self.listbox.insert(tk.END, act)
+
+        self.runner.submit(run, done, label=f"Scanning activities for {pkg}")
+
+    def launch(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showwarning("Warning", "No activity selected")
+            return
+        activity = self.listbox.get(sel[0])
+        if activity.startswith('('):
+            messagebox.showwarning("Warning", "Cannot launch this entry")
+            return
+        pkg = self.pkg_var.get().strip() or self._pkg_from_activity(activity)
+
+        def run():
+            return self.adb.launch_activity(pkg, activity, self.device_id)
+
+        def done(result):
+            output, success = result
+            if success:
+                messagebox.showinfo("Launched", f"Started {activity}")
+            else:
+                messagebox.showerror("Error", f"Launch failed:\n{output}")
+
+        self.runner.submit(run, done, label=f"Launching {activity}")
+
+    def _pkg_from_activity(self, activity):
+        """Best effort: strip leading dot and prepend package from entry."""
+        if activity.startswith('.'):
+            return self.pkg_var.get().strip() + activity
+        return activity
+
+
+class IntentSenderPanel(ttk.LabelFrame):
+    """Send custom intents and broadcasts to test receivers, services,
+    and deep links without writing a test app."""
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Intent Sender", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+
+        form = ttk.Frame(self)
+        form.pack(fill='x', pady=(0, 8))
+
+        ttk.Label(form, text="Action:").grid(row=0, column=0, sticky='w', pady=2)
+        self.action_var = tk.StringVar(value='android.intent.action.VIEW')
+        ttk.Entry(form, textvariable=self.action_var, width=40).grid(
+            row=0, column=1, sticky='ew', pady=2, padx=(5, 0))
+
+        ttk.Label(form, text="Data (URI):").grid(row=1, column=0, sticky='w', pady=2)
+        self.data_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.data_var, width=40).grid(
+            row=1, column=1, sticky='ew', pady=2, padx=(5, 0))
+
+        ttk.Label(form, text="Package:").grid(row=2, column=0, sticky='w', pady=2)
+        self.pkg_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.pkg_var, width=40).grid(
+            row=2, column=1, sticky='ew', pady=2, padx=(5, 0))
+
+        form.columnconfigure(1, weight=1)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill='x', pady=(0, 8))
+        ttk.Button(btns, text="Start Activity", command=self.start_activity).pack(side='left', padx=(0, 5))
+        ttk.Button(btns, text="Send Broadcast", command=self.send_broadcast).pack(side='left')
+
+        self.output = scrolledtext.ScrolledText(self, height=8, wrap=tk.WORD, state='disabled')
+        self.output.pack(fill='both', expand=True)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        for child in self.winfo_children():
+            if isinstance(child, (ttk.Frame, tk.Frame)):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Entry, ttk.Button)):
+                        w.config(state=state)
+
+    def _log(self, text):
+        self.output.config(state='normal')
+        self.output.insert(tk.END, text + '\n')
+        self.output.see(tk.END)
+        self.output.config(state='disabled')
+
+    def start_activity(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        action = self.action_var.get().strip()
+        data = self.data_var.get().strip()
+        pkg = self.pkg_var.get().strip()
+        if not action:
+            messagebox.showwarning("Warning", "Enter an action")
+            return
+
+        def run():
+            return self.adb.send_intent(action, data, pkg, self.device_id)
+
+        def done(result):
+            output, success = result
+            self._log(f"> am start -a {action}" + (f" -d {data}" if data else "") + (f" {pkg}" if pkg else ""))
+            self._log(output.strip() or '(no output)')
+            if not success:
+                messagebox.showerror("Error", f"Intent failed:\n{output}")
+
+        self.runner.submit(run, done, label="Sending intent")
+
+    def send_broadcast(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        action = self.action_var.get().strip()
+        if not action:
+            messagebox.showwarning("Warning", "Enter an action")
+            return
+
+        def run():
+            return self.adb.send_broadcast(action, self.device_id)
+
+        def done(result):
+            output, success = result
+            self._log(f"> am broadcast -a {action}")
+            self._log(output.strip() or '(no output)')
+            if not success:
+                messagebox.showerror("Error", f"Broadcast failed:\n{output}")
+
+        self.runner.submit(run, done, label="Sending broadcast")
+
+
+class AppOpsViewerPanel(ttk.LabelFrame):
+    """View runtime permission/op state for a package (`dumpsys appops`).
+
+    Read-only: shows which ops (location, camera, microphone, etc.) are
+    allowed, rejected, or prompted for the selected app."""
+
+    def __init__(self, parent, adb, runner, app=None):
+        super().__init__(parent, text="App Ops Viewer", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.app = app
+        self.device_id = None
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(top, text="Package:").pack(side='left')
+        self.pkg_var = tk.StringVar()
+        self.pkg_entry = ttk.Entry(top, textvariable=self.pkg_var, width=30)
+        self.pkg_entry.pack(side='left', padx=(2, 8))
+        ttk.Button(top, text="Refresh", command=self.refresh).pack(side='left')
+        ttk.Button(top, text="From selection", command=self._fill_from_app_panel).pack(side='left', padx=(8, 0))
+
+        self.output = scrolledtext.ScrolledText(self, height=16, wrap=tk.WORD, state='disabled')
+        self.output.pack(fill='both', expand=True)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        self.pkg_entry.config(state=state)
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Button, ttk.Entry)):
+                        w.config(state=state)
+
+    def _fill_from_app_panel(self):
+        apps = self._find_app_panel()
+        if apps:
+            sel = apps.app_tree.selection()
+            if sel:
+                pkg = apps.app_tree.item(sel[0], 'values')[0]
+                self.pkg_var.set(pkg)
+                return True
+        return False
+
+    def _find_app_panel(self):
+        if self.app and hasattr(self.app, 'apps_panel'):
+            return self.app.apps_panel
+        parent = self.master
+        while parent:
+            if isinstance(parent, AppManagerPanel):
+                return parent
+            parent = parent.master
+        return None
+
+    def refresh(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        pkg = self.pkg_var.get().strip()
+        if not pkg:
+            messagebox.showwarning("Warning", "Enter a package name")
+            return
+
+        def run():
+            return self.adb.get_app_ops(pkg, self.device_id)
+
+        def done(result):
+            output, success = result
+            self.output.config(state='normal')
+            self.output.delete('1.0', tk.END)
+            self.output.insert('1.0', output if success else f"(error: {output})")
+            self.output.config(state='disabled')
+
+        self.runner.submit(run, done, label=f"Reading app ops for {pkg}")
+
+
+class PackageInspectorPanel(ttk.LabelFrame):
+    """Inspect a package's full manifest via `dumpsys package`.
+
+    Shows declared permissions, activities, services, receivers, and
+    whether the app is debuggable — useful for QA and red-team recon."""
+
+    def __init__(self, parent, adb, runner, app=None):
+        super().__init__(parent, text="Package Inspector", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.app = app
+        self.device_id = None
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(top, text="Package:").pack(side='left')
+        self.pkg_var = tk.StringVar()
+        self.pkg_entry = ttk.Entry(top, textvariable=self.pkg_var, width=30)
+        self.pkg_entry.pack(side='left', padx=(2, 8))
+        ttk.Button(top, text="Inspect", command=self.inspect).pack(side='left')
+        ttk.Button(top, text="From selection", command=self._fill_from_app_panel).pack(side='left', padx=(8, 0))
+
+        self.output = scrolledtext.ScrolledText(self, height=16, wrap=tk.WORD, state='disabled')
+        self.output.pack(fill='both', expand=True)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        self.pkg_entry.config(state=state)
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Button, ttk.Entry)):
+                        w.config(state=state)
+
+    def _fill_from_app_panel(self):
+        apps = self._find_app_panel()
+        if apps:
+            sel = apps.app_tree.selection()
+            if sel:
+                pkg = apps.app_tree.item(sel[0], 'values')[0]
+                self.pkg_var.set(pkg)
+                return True
+        return False
+
+    def _find_app_panel(self):
+        if self.app and hasattr(self.app, 'apps_panel'):
+            return self.app.apps_panel
+        parent = self.master
+        while parent:
+            if isinstance(parent, AppManagerPanel):
+                return parent
+            parent = parent.master
+        return None
+
+    def inspect(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        pkg = self.pkg_var.get().strip()
+        if not pkg:
+            messagebox.showwarning("Warning", "Enter a package name")
+            return
+
+        def run():
+            return self.adb.get_app_info(pkg, self.device_id)
+
+        def done(result):
+            output, success = result
+            self.output.config(state='normal')
+            self.output.delete('1.0', tk.END)
+            self.output.insert('1.0', output if success else f"(error: {output})")
+            self.output.config(state='disabled')
+
+        self.runner.submit(run, done, label=f"Inspecting {pkg}")
+
+
+class MacroStepDialog(tk.Toplevel):
+    """Dialog to add/edit one macro step (tap, swipe, type, keyevent, sleep)."""
+
+    STEP_TYPES = ('Tap', 'Swipe', 'Type text', 'Key event', 'Sleep')
+
+    def __init__(self, parent, step=None):
+        super().__init__(parent)
+        self.title("Macro Step")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.result = None
+
+        ttk.Label(self, text="Step type:").grid(row=0, column=0, sticky='w',
+                                                 padx=10, pady=(10, 0))
+        self.type_var = tk.StringVar(value=step['type'] if step else 'Tap')
+        type_combo = ttk.Combobox(self, textvariable=self.type_var,
+                                  values=self.STEP_TYPES, state='readonly',
+                                  width=18)
+        type_combo.grid(row=0, column=1, sticky='ew', padx=10, pady=(10, 0))
+        type_combo.bind('<<ComboboxSelected>>', lambda _e: self._layout_fields())
+
+        self.fields_frame = ttk.Frame(self)
+        self.fields_frame.grid(row=1, column=0, columnspan=2, sticky='ew',
+                               padx=10, pady=10)
+        self.fields_frame.columnconfigure(1, weight=1)
+
+        self._widgets = {}
+        self.step = step or {'type': 'Tap'}
+        self._layout_fields()
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky='e', padx=10,
+                       pady=(0, 12))
+        ttk.Button(btn_frame, text="OK", command=self._ok).pack(side='left',
+                                                                 padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(
+            side='left', padx=5)
+
+        self.columnconfigure(1, weight=1)
+        self.wait_window(self)
+
+    def _layout_fields(self):
+        for w in self.fields_frame.winfo_children():
+            w.destroy()
+        self._widgets = {}
+        step_type = self.type_var.get()
+
+        def add_row(label, key, default=''):
+            row = len(self._widgets)
+            ttk.Label(self.fields_frame, text=label).grid(row=row, column=0,
+                                                          sticky='w', pady=2)
+            var = tk.StringVar(value=self.step.get(key, default))
+            entry = ttk.Entry(self.fields_frame, textvariable=var, width=30)
+            entry.grid(row=row, column=1, sticky='ew', pady=2, padx=(5, 0))
+            self._widgets[key] = var
+
+        if step_type == 'Tap':
+            add_row("X:", 'x', '0')
+            add_row("Y:", 'y', '0')
+        elif step_type == 'Swipe':
+            add_row("X1:", 'x1', '0')
+            add_row("Y1:", 'y1', '0')
+            add_row("X2:", 'x2', '0')
+            add_row("Y2:", 'y2', '0')
+            add_row("Duration (ms):", 'duration', '300')
+        elif step_type == 'Type text':
+            add_row("Text:", 'text', '')
+        elif step_type == 'Key event':
+            add_row("Keycode/name:", 'keycode', 'KEYCODE_HOME')
+        elif step_type == 'Sleep':
+            add_row("Milliseconds:", 'ms', '500')
+
+    def _ok(self):
+        step_type = self.type_var.get()
+        step = {'type': step_type}
+        for key, var in self._widgets.items():
+            step[key] = var.get().strip()
+        self.result = step
+        self.destroy()
+
+
+class MacroPanel(ttk.LabelFrame):
+    """Record, edit, save, and replay input macros (no root required).
+
+    Steps are plain `adb shell input` commands: tap, swipe, text, keyevent,
+    and sleep. Build a macro step by step, then play it back on the device.
+    """
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Macro Recorder", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+        self.steps = []
+        self._playing = False
+        self._play_job = None
+
+        # Steps list
+        list_frame = ttk.Frame(self)
+        list_frame.pack(fill='both', expand=True, pady=(0, 5))
+
+        self.listbox = tk.Listbox(list_frame, height=8)
+        self.listbox.pack(side='left', fill='both', expand=True)
+        scroll = ttk.Scrollbar(list_frame, orient='vertical',
+                               command=self.listbox.yview)
+        self.listbox.configure(yscroll=scroll.set)
+        scroll.pack(side='right', fill='y')
+
+        # Step editor
+        edit_frame = ttk.Frame(self)
+        edit_frame.pack(fill='x', pady=(0, 5))
+        ttk.Button(edit_frame, text="Add Step",
+                   command=self.add_step).pack(side='left', padx=2)
+        ttk.Button(edit_frame, text="Edit Step",
+                   command=self.edit_step).pack(side='left', padx=2)
+        ttk.Button(edit_frame, text="Remove",
+                   command=self.remove_step).pack(side='left', padx=2)
+        ttk.Button(edit_frame, text="Move Up",
+                   command=lambda: self._move_step(-1)).pack(side='left',
+                                                              padx=2)
+        ttk.Button(edit_frame, text="Move Down",
+                   command=lambda: self._move_step(1)).pack(side='left',
+                                                             padx=2)
+
+        # Playback controls
+        play_frame = ttk.Frame(self)
+        play_frame.pack(fill='x', pady=(0, 5))
+        self.play_btn = ttk.Button(play_frame, text="Play Macro",
+                                   command=self.play_macro)
+        self.play_btn.pack(side='left', padx=2)
+        self.stop_btn = ttk.Button(play_frame, text="Stop",
+                                   command=self.stop_macro, state='disabled')
+        self.stop_btn.pack(side='left', padx=2)
+
+        # File ops
+        file_frame = ttk.Frame(self)
+        file_frame.pack(fill='x')
+        ttk.Button(file_frame, text="Save Macro",
+                   command=self.save_macro).pack(side='left', padx=2)
+        ttk.Button(file_frame, text="Load Macro",
+                   command=self.load_macro).pack(side='left', padx=2)
+        ttk.Button(file_frame, text="Clear",
+                   command=self.clear_macro).pack(side='left', padx=2)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Button, tk.Listbox)):
+                        w.config(state=state)
+        self.listbox.config(state=state)
+
+    def _step_text(self, step):
+        t = step['type']
+        if t == 'Tap':
+            return f"TAP ({step.get('x','0')},{step.get('y','0')})"
+        if t == 'Swipe':
+            return (f"SWIPE ({step.get('x1','0')},{step.get('y1','0')})"
+                    f" -> ({step.get('x2','0')},{step.get('y2','0')})"
+                    f" {step.get('duration','300')}ms")
+        if t == 'Type text':
+            return f"TYPE {step.get('text','')}"
+        if t == 'Key event':
+            return f"KEY {step.get('keycode','KEYCODE_HOME')}"
+        if t == 'Sleep':
+            return f"SLEEP {step.get('ms','500')}ms"
+        return f"UNKNOWN {t}"
+
+    def refresh_list(self):
+        self.listbox.delete(0, tk.END)
+        for step in self.steps:
+            self.listbox.insert(tk.END, self._step_text(step))
+
+    def add_step(self):
+        dlg = MacroStepDialog(self)
+        if dlg.result:
+            self.steps.append(dlg.result)
+            self.refresh_list()
+
+    def edit_step(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showwarning("Warning", "No step selected")
+            return
+        idx = sel[0]
+        dlg = MacroStepDialog(self, self.steps[idx])
+        if dlg.result:
+            self.steps[idx] = dlg.result
+            self.refresh_list()
+
+    def remove_step(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        del self.steps[idx]
+        self.refresh_list()
+
+    def _move_step(self, delta):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        new = idx + delta
+        if 0 <= new < len(self.steps):
+            self.steps[idx], self.steps[new] = self.steps[new], self.steps[idx]
+            self.refresh_list()
+            self.listbox.selection_set(new)
+
+    def clear_macro(self):
+        self.steps = []
+        self.refresh_list()
+
+    def save_macro(self):
+        if not self.steps:
+            messagebox.showwarning("Warning", "No steps to save")
+            return
+        path = filedialog.asksaveasfilename(defaultextension='.json',
+                                            filetypes=[("JSON", "*.json")],
+                                            title="Save macro")
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                json.dump(self.steps, fh, indent=2)
+            messagebox.showinfo("Saved", f"Macro saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Save failed:\n{e}")
+
+    def load_macro(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")],
+                                          title="Load macro")
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                self.steps = json.load(fh)
+            self.refresh_list()
+            messagebox.showinfo("Loaded", f"Macro loaded from {path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Load failed:\n{e}")
+
+    def play_macro(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        if not self.steps:
+            messagebox.showwarning("Warning", "Macro is empty")
+            return
+        if self._playing:
+            return
+        self._playing = True
+        self.play_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')
+
+        def run():
+            device_id = self.device_id
+            for i, step in enumerate(self.steps):
+                if not self._playing:
+                    break
+                ok = self._exec_step(device_id, step, i)
+                if not ok:
+                    return f"Step {i + 1} failed: {step['type']}"
+                ms = step.get('ms') or 0
+                # Sleep between steps (except the last)
+                if i < len(self.steps) - 1 and ms:
+                    import time as _time
+                    _time.sleep(ms / 1000.0)
+            return None
+
+        def done(result):
+            self._playing = False
+            self.play_btn.config(state='normal')
+            self.stop_btn.config(state='disabled')
+            if result:
+                messagebox.showerror("Error", str(result))
+            else:
+                messagebox.showinfo("Done", "Macro finished")
+
+        self.runner.submit(run, done, label="Playing macro")
+
+    def stop_macro(self):
+        self._playing = False
+
+    def _exec_step(self, device_id, step, index):
+        t = step['type']
+        try:
+            if t == 'Tap':
+                x = int(step.get('x', '0'))
+                y = int(step.get('y', '0'))
+                out, ok = self.adb.run_shell_command(
+                    f'input tap {x} {y}', device_id)
+            elif t == 'Swipe':
+                x1 = int(step.get('x1', '0'))
+                y1 = int(step.get('y1', '0'))
+                x2 = int(step.get('x2', '0'))
+                y2 = int(step.get('y2', '0'))
+                dur = int(step.get('duration', '300'))
+                out, ok = self.adb.run_shell_command(
+                    f'input swipe {x1} {y1} {x2} {y2} {dur}', device_id)
+            elif t == 'Type text':
+                text = step.get('text', '')
+                # Escape spaces for adb shell input text
+                safe = text.replace(' ', '%s')
+                out, ok = self.adb.run_shell_command(
+                    f'input text {safe}', device_id)
+            elif t == 'Key event':
+                key = step.get('keycode', 'KEYCODE_HOME')
+                out, ok = self.adb.run_shell_command(
+                    f'input keyevent {key}', device_id)
+            elif t == 'Sleep':
+                # Sleep handled by caller between steps
+                return True
+            else:
+                return False
+            return ok
+        except Exception:
+            return False
+
+
+class SchedulerPanel(ttk.LabelFrame):
+    """Run an ADB shell command on a repeating interval.
+
+    Useful for polling a property, repeating a keyevent, or any
+    command that should run every N seconds until stopped.
+    """
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Scheduler", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+        self._running = False
+        self._job = None
+        self._count = 0
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(top, text="Command:").pack(side='left')
+        self.cmd_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.cmd_var, width=30).pack(
+            side='left', padx=(2, 8), fill='x', expand=True)
+
+        ttk.Label(top, text="Every (s):").pack(side='left')
+        self.interval_var = tk.StringVar(value='5')
+        ttk.Entry(top, textvariable=self.interval_var, width=6).pack(
+            side='left', padx=(2, 8))
+
+        self.start_btn = ttk.Button(top, text="Start", command=self.start)
+        self.start_btn.pack(side='left', padx=2)
+        self.stop_btn = ttk.Button(top, text="Stop", command=self.stop,
+                                   state='disabled')
+        self.stop_btn.pack(side='left', padx=2)
+
+        self.count_var = tk.StringVar(value="Runs: 0")
+        ttk.Label(top, textvariable=self.count_var).pack(side='left',
+                                                         padx=(10, 0))
+
+        self.output = scrolledtext.ScrolledText(self, height=10, wrap=tk.WORD,
+                                                state='disabled')
+        self.output.pack(fill='both', expand=True)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Entry, ttk.Button)):
+                        w.config(state=state)
+        self.output.config(state=state)
+        if not device_id:
+            self.stop()
+
+    def _log(self, text):
+        self.output.config(state='normal')
+        self.output.insert(tk.END, text + '\n')
+        self.output.see(tk.END)
+        self.output.config(state='disabled')
+
+    def start(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        cmd = self.cmd_var.get().strip()
+        if not cmd:
+            messagebox.showwarning("Warning", "Enter a command")
+            return
+        try:
+            interval = float(self.interval_var.get())
+            if interval <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Interval must be a positive number")
+            return
+
+        self._running = True
+        self._count = 0
+        self.count_var.set("Runs: 0")
+        self.start_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')
+        self.output.config(state='normal')
+        self.output.delete('1.0', tk.END)
+        self.output.config(state='disabled')
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        if self._job:
+            self.after_cancel(self._job)
+            self._job = None
+        self.start_btn.config(state='normal')
+        self.stop_btn.config(state='disabled')
+
+    def _tick(self):
+        if not self._running:
+            return
+
+        def run():
+            return self.adb.run_shell_command(self.cmd_var.get().strip(),
+                                              self.device_id)
+
+        def done(result):
+            output, success = result
+            self._count += 1
+            self.count_var.set(f"Runs: {self._count}")
+            prefix = "OK" if success else "FAIL"
+            snippet = output.strip().replace('\n', ' | ')[:120]
+            self._log(f"[{prefix}] {snippet}")
+            if self._running:
+                self._job = self.after(int(float(self.interval_var.get()) * 1000),
+                                       self._tick)
+
+        self.runner.submit(run, done, label="Scheduled command")
+
+
+class TimelapsePanel(ttk.LabelFrame):
+    """Auto-screenshot timelapse: capture the screen every N seconds to a
+    folder on the PC. Works on non-rooted devices."""
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Screenshot Timelapse", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+        self._running = False
+        self._job = None
+        self._count = 0
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(top, text="Folder:").pack(side='left')
+        self.folder_var = tk.StringVar(value=str(Path.home()))
+        ttk.Entry(top, textvariable=self.folder_var, width=30).pack(
+            side='left', padx=(2, 5), fill='x', expand=True)
+        ttk.Button(top, text="Browse", command=self.browse_folder).pack(
+            side='left', padx=(2, 8))
+
+        ttk.Label(top, text="Every (s):").pack(side='left')
+        self.interval_var = tk.StringVar(value='10')
+        ttk.Entry(top, textvariable=self.interval_var, width=6).pack(
+            side='left', padx=(2, 8))
+
+        self.start_btn = ttk.Button(top, text="Start", command=self.start)
+        self.start_btn.pack(side='left', padx=2)
+        self.stop_btn = ttk.Button(top, text="Stop", command=self.stop,
+                                   state='disabled')
+        self.stop_btn.pack(side='left', padx=2)
+
+        self.count_var = tk.StringVar(value="Captures: 0")
+        ttk.Label(top, textvariable=self.count_var).pack(side='left',
+                                                         padx=(10, 0))
+
+        self.output = scrolledtext.ScrolledText(self, height=8, wrap=tk.WORD,
+                                                state='disabled')
+        self.output.pack(fill='both', expand=True)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, (ttk.Entry, ttk.Button)):
+                        w.config(state=state)
+        self.output.config(state=state)
+        if not device_id:
+            self.stop()
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.folder_var.get())
+        if folder:
+            self.folder_var.set(folder)
+
+    def _log(self, text):
+        self.output.config(state='normal')
+        self.output.insert(tk.END, text + '\n')
+        self.output.see(tk.END)
+        self.output.config(state='disabled')
+
+    def start(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        folder = self.folder_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Choose a valid folder")
+            return
+        try:
+            interval = float(self.interval_var.get())
+            if interval <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Interval must be a positive number")
+            return
+
+        self._running = True
+        self._count = 0
+        self.count_var.set("Captures: 0")
+        self.start_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')
+        self.output.config(state='normal')
+        self.output.delete('1.0', tk.END)
+        self.output.config(state='disabled')
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        if self._job:
+            self.after_cancel(self._job)
+            self._job = None
+        self.start_btn.config(state='normal')
+        self.stop_btn.config(state='disabled')
+
+    def _tick(self):
+        if not self._running:
+            return
+
+        folder = self.folder_var.get().strip()
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        save_path = os.path.join(folder, f"screenshot_{timestamp}.png")
+
+        def run():
+            return self.adb.take_screenshot(save_path, self.device_id)
+
+        def done(result):
+            output, success = result
+            self._count += 1
+            self.count_var.set(f"Captures: {self._count}")
+            if success:
+                self._log(f"Saved {save_path}")
+            else:
+                self._log(f"Failed: {output}")
+            if self._running:
+                self._job = self.after(
+                    int(float(self.interval_var.get()) * 1000), self._tick)
+
+        self.runner.submit(run, done, label="Capturing screenshot")
+
+
+class ExportReportPanel(ttk.LabelFrame):
+    """Export a full device report: info, battery, CPU, packages, and recent
+    logcat to a text file for bug reports or documentation."""
+
+    def __init__(self, parent, adb, runner):
+        super().__init__(parent, text="Export Device Report", padding=10)
+        self.adb = adb
+        self.runner = runner
+        self.device_id = None
+
+        top = ttk.Frame(self)
+        top.pack(fill='x', pady=(0, 5))
+        ttk.Button(top, text="Export Report", command=self.export).pack(
+            side='left')
+
+        self.output = scrolledtext.ScrolledText(self, height=12, wrap=tk.WORD,
+                                                state='disabled')
+        self.output.pack(fill='both', expand=True)
+
+        self.set_device(None)
+
+    def set_device(self, device_id):
+        self.device_id = device_id
+        state = 'normal' if device_id else 'disabled'
+        for child in self.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for w in child.winfo_children():
+                    if isinstance(w, ttk.Button):
+                        w.config(state=state)
+
+    def _log(self, text):
+        self.output.config(state='normal')
+        self.output.insert(tk.END, text + '\n')
+        self.output.see(tk.END)
+        self.output.config(state='disabled')
+
+    def export(self):
+        if not self.device_id:
+            messagebox.showerror("Error", "No device selected")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension='.txt',
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+            title="Save device report")
+        if not path:
+            return
+
+        def run():
+            parts = []
+            parts.append("=== ADB GUI Device Report ===")
+            parts.append(f"Generated: {datetime.now().isoformat()}")
+            parts.append(f"Device: {self.device_id}")
+            parts.append("")
+
+            # Device info
+            parts.append("=== DEVICE INFO ===")
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell',
+                                           'getprop')
+            parts.append(out if ok else f"(error: {out})")
+            parts.append("")
+
+            # Battery
+            parts.append("=== BATTERY ===")
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell',
+                                           'dumpsys', 'battery')
+            parts.append(out if ok else f"(error: {out})")
+            parts.append("")
+
+            # CPU
+            parts.append("=== CPU ===")
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell',
+                                           'dumpsys', 'cpuinfo')
+            parts.append(out if ok else f"(error: {out})")
+            parts.append("")
+
+            # Packages (count + list)
+            parts.append("=== PACKAGES ===")
+            out, ok = self.adb.list_packages(self.device_id,
+                                             third_party_only=True)
+            if ok:
+                pkgs = [l.replace('package:', '').strip()
+                        for l in out.splitlines() if l.strip()]
+                parts.append(f"Third-party apps: {len(pkgs)}")
+                parts.append(out)
+            else:
+                parts.append(f"(error: {out})")
+            parts.append("")
+
+            # Recent logcat (last 100 lines)
+            parts.append("=== LOGCAT (last 100 lines) ===")
+            out, ok = self.adb.run_command('-s', self.device_id, 'shell',
+                                           'logcat', '-d', '-t', '100')
+            parts.append(out if ok else f"(error: {out})")
+
+            return "\n".join(parts)
+
+        def done(report):
+            try:
+                with open(path, 'w', encoding='utf-8') as fh:
+                    fh.write(report)
+                messagebox.showinfo("Exported",
+                                    f"Device report saved to:\n{path}")
+                self.output.config(state='normal')
+                self.output.delete('1.0', tk.END)
+                self.output.insert('1.0', report[:2000] +
+                                   ("\n... (truncated in view)"
+                                    if len(report) > 2000 else ""))
+                self.output.config(state='disabled')
+            except Exception as e:
+                messagebox.showerror("Error", f"Save failed:\n{e}")
+
+        self.runner.submit(run, done, label="Exporting device report")
+
+
 class ADBGUI(tk.Tk):
     """Main application window"""
     
@@ -1897,13 +4024,15 @@ class ADBGUI(tk.Tk):
         super().__init__()
         
         self.title("ADB GUI - Android Debug Bridge Interface")
-        self.geometry("1200x700")
+        self.geometry(CONFIG.get('window_geometry', '1200x700'))
         
         self.adb = ADBWrapper()
+        self.settings = CONFIG
         self._device_text = "Ready"
         self._busy_label = None
         self._closing = False
         self._last_device_id = None
+        self._dark_mode = self.settings.get('dark_mode', False)
         self.runner = TaskRunner(self, on_status=self._on_busy_status)
         
         main_container = ttk.Frame(self, padding=10)
@@ -1922,10 +4051,30 @@ class ADBGUI(tk.Tk):
         self.create_shell_tab()
         self.create_logcat_tab()
         self.create_tools_tab()
+        self.create_port_forward_tab()
+        self.create_hardware_monitor_tab()
+        self.create_device_controls_tab()
+        self.create_apk_extractor_tab()
+        self.create_multi_device_tab()
+        self.create_activity_launcher_tab()
+        self.create_intent_sender_tab()
+        self.create_app_ops_tab()
+        self.create_package_inspector_tab()
+        self.create_macro_tab()
+        self.create_scheduler_tab()
+        self.create_timelapse_tab()
+        self.create_export_report_tab()
         
         self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(main_container, textvariable=self.status_var, relief='sunken', anchor='w')
+        status_bar = ttk.Frame(main_container)
         status_bar.pack(fill='x', pady=(10, 0))
+        ttk.Label(status_bar, textvariable=self.status_var, relief='sunken',
+                  anchor='w').pack(side='left', fill='x', expand=True)
+        self.dark_mode_var = tk.BooleanVar(value=self._dark_mode)
+        ttk.Checkbutton(status_bar, text="Dark mode",
+                        variable=self.dark_mode_var,
+                        command=self.toggle_dark_mode).pack(side='right')
+        self._apply_theme()
         
         self.device_panel.refresh_devices()
         self._start_device_tracking()
@@ -1939,6 +4088,12 @@ class ADBGUI(tk.Tk):
     def destroy(self):
         """Shut background work down before the window goes away."""
         self._closing = True
+        # Remember window geometry for next launch.
+        try:
+            self.settings.set('window_geometry', self.geometry())
+            self.settings.save()
+        except Exception:
+            pass
         if getattr(self, '_window_gone', False):
             return
         if not getattr(self, '_torn_down', False):
@@ -1949,6 +4104,14 @@ class ADBGUI(tk.Tk):
                 # deletes the Tcl command globally while the panel still
                 # lists it, and the panel's own destroy then fails.
                 self.logcat_panel.close()
+            if hasattr(self, 'hardware_panel'):
+                self.hardware_panel._toggle_auto(False)
+            if hasattr(self, 'scheduler_panel'):
+                self.scheduler_panel.stop()
+            if hasattr(self, 'timelapse_panel'):
+                self.timelapse_panel.stop()
+            if hasattr(self, 'macro_panel'):
+                self.macro_panel.stop_macro()
             if hasattr(self, 'adb'):
                 self.adb.stop_tracking()
             if hasattr(self, 'runner'):
@@ -2003,7 +4166,111 @@ class ADBGUI(tk.Tk):
         
         self.tools_panel = ToolsPanel(frame, self.adb, self.runner)
         self.tools_panel.pack(fill='both', expand=True)
-    
+
+    def create_port_forward_tab(self):
+        """Create port forwarding tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Port Forwarding")
+        
+        self.port_forward_panel = PortForwardPanel(frame, self.adb, self.runner)
+        self.port_forward_panel.pack(fill='both', expand=True)
+
+    def create_hardware_monitor_tab(self):
+        """Create hardware monitor tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Hardware Monitor")
+        
+        self.hardware_panel = HardwareMonitorPanel(frame, self.adb, self.runner)
+        self.hardware_panel.pack(fill='both', expand=True)
+
+    def create_device_controls_tab(self):
+        """Create device controls tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Device Controls")
+        
+        self.controls_panel = RemoteControlPanel(frame, self.adb, self.runner)
+        self.controls_panel.pack(fill='both', expand=True)
+
+    def create_apk_extractor_tab(self):
+        """Create APK extractor tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="APK Extractor")
+        
+        self.apk_panel = ApkExtractorPanel(frame, self.adb, self.runner, app=self)
+        self.apk_panel.pack(fill='both', expand=True)
+
+    def create_multi_device_tab(self):
+        """Create multi-device tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Multi-Device")
+        
+        self.multi_panel = MultiDevicePanel(frame, self.adb, self.runner)
+        self.multi_panel.pack(fill='both', expand=True)
+
+    def create_activity_launcher_tab(self):
+        """Create activity launcher tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Activity Launcher")
+        
+        self.activity_panel = ActivityLauncherPanel(frame, self.adb, self.runner, app=self)
+        self.activity_panel.pack(fill='both', expand=True)
+
+    def create_intent_sender_tab(self):
+        """Create intent sender tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Intent Sender")
+        
+        self.intent_panel = IntentSenderPanel(frame, self.adb, self.runner)
+        self.intent_panel.pack(fill='both', expand=True)
+
+    def create_app_ops_tab(self):
+        """Create app ops viewer tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="App Ops")
+        
+        self.appops_panel = AppOpsViewerPanel(frame, self.adb, self.runner, app=self)
+        self.appops_panel.pack(fill='both', expand=True)
+
+    def create_package_inspector_tab(self):
+        """Create package inspector tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Package Inspector")
+        
+        self.pkg_inspector_panel = PackageInspectorPanel(frame, self.adb, self.runner, app=self)
+        self.pkg_inspector_panel.pack(fill='both', expand=True)
+
+    def create_macro_tab(self):
+        """Create macro recorder tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Macro Recorder")
+        
+        self.macro_panel = MacroPanel(frame, self.adb, self.runner)
+        self.macro_panel.pack(fill='both', expand=True)
+
+    def create_scheduler_tab(self):
+        """Create scheduler tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Scheduler")
+        
+        self.scheduler_panel = SchedulerPanel(frame, self.adb, self.runner)
+        self.scheduler_panel.pack(fill='both', expand=True)
+
+    def create_timelapse_tab(self):
+        """Create screenshot timelapse tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Screenshot Timelapse")
+        
+        self.timelapse_panel = TimelapsePanel(frame, self.adb, self.runner)
+        self.timelapse_panel.pack(fill='both', expand=True)
+
+    def create_export_report_tab(self):
+        """Create export report tab"""
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Export Report")
+        
+        self.export_panel = ExportReportPanel(frame, self.adb, self.runner)
+        self.export_panel.pack(fill='both', expand=True)
+
     def on_device_change(self, device_id):
         """Handle a device selection or device state change.
 
@@ -2023,6 +4290,19 @@ class ADBGUI(tk.Tk):
             self.shell_panel.set_device(device_id)
             self.logcat_panel.set_device(device_id)
             self.tools_panel.set_device(device_id)
+            self.port_forward_panel.set_device(device_id)
+            self.hardware_panel.set_device(device_id)
+            self.controls_panel.set_device(device_id)
+            self.apk_panel.set_device(device_id)
+            self.activity_panel.set_device(device_id)
+            self.intent_panel.set_device(device_id)
+            self.appops_panel.set_device(device_id)
+            self.pkg_inspector_panel.set_device(device_id)
+            self.macro_panel.set_device(device_id)
+            self.scheduler_panel.set_device(device_id)
+            self.timelapse_panel.set_device(device_id)
+            self.export_panel.set_device(device_id)
+            self.multi_panel.tree.delete(*self.multi_panel.tree.get_children())
         
         if device_id:
             self._device_text = f"Connected to: {device_id}"
@@ -2042,6 +4322,46 @@ class ADBGUI(tk.Tk):
         if self._busy_label:
             text = f"{text} — {self._busy_label}…"
         self.status_var.set(text)
+
+    def _apply_theme(self):
+        """Apply light or dark ttk theme based on self._dark_mode."""
+        style = ttk.Style(self)
+        if self._dark_mode:
+            # Clam theme is the most customizable; override key colors.
+            style.theme_use('clam')
+            style.configure('.', background='#2b2b2b', foreground='#ffffff',
+                            fieldbackground='#3c3c3c')
+            style.configure('TFrame', background='#2b2b2b')
+            style.configure('TLabel', background='#2b2b2b',
+                            foreground='#ffffff')
+            style.configure('TEntry', fieldbackground='#3c3c3c',
+                            foreground='#ffffff')
+            style.configure('TCombobox', fieldbackground='#3c3c3c',
+                            foreground='#ffffff')
+            style.configure('TCheckbutton', background='#2b2b2b',
+                            foreground='#ffffff')
+            style.configure('TRadiobutton', background='#2b2b2b',
+                            foreground='#ffffff')
+            style.configure('TButton', background='#3c3c3c',
+                            foreground='#ffffff')
+            style.map('TButton', background=[('active', '#4a4a4a')])
+            style.configure('TNotebook', background='#2b2b2b')
+            style.configure('TNotebook.Tab', background='#3c3c3c',
+                            foreground='#ffffff')
+            style.map('TNotebook.Tab', background=[('selected', '#4a4a4a')])
+            style.configure('Horizontal.TProgressbar',
+                            background='#4a4a4a')
+            self.configure(bg='#2b2b2b')
+        else:
+            style.theme_use('default')
+            self.configure(bg='')
+
+    def toggle_dark_mode(self):
+        """Toggle dark mode on/off and persist the choice."""
+        self._dark_mode = bool(self.dark_mode_var.get())
+        self.settings.set('dark_mode', self._dark_mode)
+        self.settings.save()
+        self._apply_theme()
     
     def _start_device_tracking(self):
         """Follow `adb track-devices` so the list updates the instant it changes."""
